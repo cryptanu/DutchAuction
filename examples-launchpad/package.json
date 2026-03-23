@@ -1,0 +1,9 @@
+{
+  "name": "@najnomics/examples-launchpad",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reference integration examples for Stealth Dutch Auction SDK",
+  "scripts": {
+    "example": "node src/basic-flow.example.js"
+  }
+}

@@ -1,0 +1,129 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where([data-theme=dark], [data-theme=dark] *));
+
+@theme {
+  --shadow-center: 0 18px 45px -20px rgb(12 22 40 / 0.35);
+}
+
+@plugin "daisyui" {
+  themes:
+    auctionlight,
+    auctionnight;
+}
+
+@plugin "daisyui/theme" {
+  name: "auctionlight";
+
+  --color-primary: #155eef;
+  --color-primary-content: #f7f9ff;
+  --color-secondary: #0f766e;
+  --color-secondary-content: #f8fffe;
+  --color-accent: #f59e0b;
+  --color-accent-content: #261700;
+  --color-neutral: #0f172a;
+  --color-neutral-content: #f8fafc;
+  --color-base-100: #f7fafc;
+  --color-base-200: #eef3f9;
+  --color-base-300: #d6e2ef;
+  --color-base-content: #0f172a;
+  --color-info: #1d4ed8;
+  --color-success: #059669;
+  --color-warning: #d97706;
+  --color-error: #dc2626;
+
+  --radius-field: 0.9rem;
+  --radius-box: 1.2rem;
+  --tt-tailw: 8px;
+}
+
+@plugin "daisyui/theme" {
+  name: "auctionnight";
+
+  --color-primary: #60a5fa;
+  --color-primary-content: #08162f;
+  --color-secondary: #5eead4;
+  --color-secondary-content: #052c2d;
+  --color-accent: #fbbf24;
+  --color-accent-content: #2f2000;
+  --color-neutral: #e2e8f0;
+  --color-neutral-content: #0f172a;
+  --color-base-100: #081225;
+  --color-base-200: #0e1f3b;
+  --color-base-300: #203356;
+  --color-base-content: #e2e8f0;
+  --color-info: #60a5fa;
+  --color-success: #34d399;
+  --color-warning: #fbbf24;
+  --color-error: #f87171;
+
+  --radius-field: 0.9rem;
+  --radius-box: 1.2rem;
+  --tt-tailw: 8px;
+  --tt-bg: var(--color-primary);
+}
+
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentColor);
+  }
+
+  html,
+  body {
+    min-height: 100%;
+  }
+
+  body {
+    min-height: 100vh;
+    background:
+      radial-gradient(circle at 0% 0%, rgb(245 158 11 / 0.18), transparent 28%),
+      radial-gradient(circle at 90% 100%, rgb(21 94 239 / 0.16), transparent 36%),
+      var(--color-base-200);
+  }
+
+  p {
+    margin: 0.75rem 0;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    margin-bottom: 0.45rem;
+    line-height: 1.1;
+  }
+}
+
+:root,
+[data-theme] {
+  color: var(--color-base-content);
+  background-color: var(--color-base-200);
+}
+
+/*
+ * DaisyUI v5 dims :root when any modal-toggle checkbox is checked.
+ * Browsers may restore checkbox state on refresh, which can leave the whole app
+ * permanently dark even when no dialog is visible.
+ */
+:where(
+    :root:has(.modal-open, .modal[open], .modal:target, .modal-toggle:checked, .drawer:not(.drawer-open) > .drawer-toggle:checked)
+  ) {
+  --root-bg: var(--color-base-200);
+  background-image: none;
+}
+
+.btn {
+  @apply shadow-md;
+}
+
+.btn.btn-ghost {
+  @apply shadow-none;
+}
+
+code {
+  font-size: 0.88em;
+}

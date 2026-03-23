@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+      - name: Run Foundry tests
+        run: forge test
+
+  sdk-and-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Enable Corepack
+        run: corepack enable
+      - name: Install frontend deps (toolchain source)
+        run: |
+          cd frontend
+          yarn install --immutable
+      - name: Typecheck SDK
+        run: |
+          cd frontend
+          yarn tsc -p ../packages/sdk-ts/tsconfig.json --noEmit
+      - name: Build SDK + run SDK tests
+        run: |
+          cd frontend
+          yarn tsc -p ../packages/sdk-ts/tsconfig.json
+          cd ..
+          node --test packages/sdk-ts/dist/test/**/*.test.js
+      - name: Enforce no legacy cofhejs references
+        run: bash scripts/check-no-legacy-cofhe.sh

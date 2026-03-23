@@ -1,0 +1,11 @@
+{
+  "name": "@najnomics/dutch-auction-contracts-core",
+  "version": "0.1.0",
+  "description": "Contract artifacts and deployment metadata for Stealth Dutch Auction",
+  "license": "MIT",
+  "files": [
+    "abi",
+    "metadata",
+    "README.md"
+  ]
+}

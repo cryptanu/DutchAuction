@@ -1,0 +1,15 @@
+{
+  "name": "dutch-auction-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "examples-launchpad",
+    "frontend"
+  ],
+  "scripts": {
+    "test:contracts": "forge test",
+    "check:sdk": "cd frontend && corepack yarn tsc -p ../packages/sdk-ts/tsconfig.json --noEmit",
+    "test:sdk": "cd frontend && corepack yarn tsc -p ../packages/sdk-ts/tsconfig.json && cd .. && node --test packages/sdk-ts/dist/test/**/*.test.js",
+    "check:legacy": "bash scripts/check-no-legacy-cofhe.sh"
+  }
+}
