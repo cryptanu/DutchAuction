@@ -97,10 +97,9 @@ contract StealthDutchAuctionHookTest is Test {
     function test_buyWithPaymentTokenEncrypted_settlesWithoutSwap() public {
         paymentToken.mint(buyer, 1_500);
         InEuint128 memory desiredAuctionTokens = _encryptUint128(10);
-        InEuint128 memory maxPricePerToken = _encryptUint128(110);
 
         vm.prank(buyer);
-        uint128 spent = hook.buyWithPaymentTokenEncrypted(poolId, desiredAuctionTokens, maxPricePerToken);
+        uint128 spent = hook.buyWithPaymentTokenEncrypted(poolId, desiredAuctionTokens, 110);
 
         assertEq(spent, 0);
         assertEq(weth.balanceOf(buyer), 1_000);
@@ -143,10 +142,9 @@ contract StealthDutchAuctionHookTest is Test {
     function test_buyWithPaymentTokenEncrypted_priceAboveLimit_noSettlement() public {
         paymentToken.mint(buyer, 2_000);
         InEuint128 memory desiredAuctionTokens = _encryptUint128(10);
-        InEuint128 memory maxPricePerToken = _encryptUint128(90);
 
         vm.prank(buyer);
-        hook.buyWithPaymentTokenEncrypted(poolId, desiredAuctionTokens, maxPricePerToken);
+        hook.buyWithPaymentTokenEncrypted(poolId, desiredAuctionTokens, 90);
 
         assertEq(paymentToken.balanceOf(buyer), 2_000);
         assertEq(paymentToken.balanceOf(seller), 0);
@@ -271,8 +269,8 @@ contract StealthDutchAuctionHookTest is Test {
         return abi.encode(
             StealthDutchAuctionHook.AuctionIntentEncrypted({
                 desiredAuctionTokens: _encryptUint128(desiredAuctionTokens),
-                maxPricePerToken: _encryptUint128(maxPricePerToken),
-                minPaymentTokensFromSwap: _encryptUint128(minPaymentTokensFromSwap)
+                maxPricePerToken: maxPricePerToken,
+                minPaymentTokensFromSwap: minPaymentTokensFromSwap
             })
         );
     }

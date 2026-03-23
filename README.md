@@ -132,3 +132,6 @@ NEXT_PUBLIC_BASE_SEPOLIA_RPC_URL=https://sepolia.base.org
 - No logic was copied from the external repository reference; implementation was built from architecture requirements.
 - v1 is SDK-first and self-serve. Plugin packaging is deferred to v2.
 - Legacy `cofhejs` pathways are fail-closed; migration target is `@cofhe/sdk`.
+- Known issue (as of 2026-03-23): swap + hook settlement on Base Sepolia can still revert during gas estimation with
+  `exceeds max transaction gas limit` even after sender-context and ACL hardening patches. Direct encrypted buy and
+  local/unit/e2e tests pass; on-chain swap investigation remains open.

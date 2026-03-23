@@ -1,4 +1,4 @@
-import { Address, Hex, encodeAbiParameters, isAddress, isHex, keccak256 } from "viem";
+import { Address, Hex, decodeAbiParameters, encodeAbiParameters, isAddress, isHex, keccak256 } from "viem";
 import { HookDataMode } from "~~/lib/auction/abis";
 
 export type PoolKey = {
@@ -32,76 +32,67 @@ export type HookDataBuildInput = {
   }) => Promise<Hex> | Hex;
   proofs?: {
     desiredAuctionTokens: InEProof;
-    maxPricePerToken: InEProof;
-    minPaymentTokensFromSwap: InEProof;
   };
 };
 
-const ensureProof = (proof: InEProof, label: string): InEProof => {
-  if (proof.securityZone < 0 || proof.securityZone > 255) {
+const PROOF_TUPLE_COMPONENTS = [
+  { name: "ctHash", type: "uint256" },
+  { name: "securityZone", type: "uint8" },
+  { name: "utype", type: "uint8" },
+  { name: "signature", type: "bytes" },
+] as const;
+
+const PROOFS_ABI = [
+  {
+    type: "tuple",
+    components: [
+      { name: "desiredAuctionTokens", type: "tuple", components: PROOF_TUPLE_COMPONENTS },
+      { name: "maxPricePerToken", type: "uint128" },
+      { name: "minPaymentTokensFromSwap", type: "uint128" },
+    ],
+  },
+] as const;
+
+export const ensureProofRequiredFields = (proof: InEProof, label: string): InEProof => {
+  if (proof.ctHash <= 0n) {
+    throw new Error(`${label}.ctHash must be > 0.`);
+  }
+  if (!Number.isInteger(proof.securityZone) || proof.securityZone < 0 || proof.securityZone > 255) {
     throw new Error(`${label}.securityZone must be in uint8 range.`);
   }
-  if (proof.utype < 0 || proof.utype > 255) {
+  if (!Number.isInteger(proof.utype) || proof.utype < 0 || proof.utype > 255) {
     throw new Error(`${label}.utype must be in uint8 range.`);
   }
   if (!isHex(proof.signature)) {
     throw new Error(`${label}.signature must be hex bytes.`);
   }
-  return proof;
+  // Return only required InE tuple fields used by contract verification.
+  return {
+    ctHash: proof.ctHash,
+    securityZone: proof.securityZone,
+    utype: proof.utype,
+    signature: proof.signature,
+  };
 };
 
-const buildIntentProofs = (proofs: {
-  desiredAuctionTokens: InEProof;
-  maxPricePerToken: InEProof;
-  minPaymentTokensFromSwap: InEProof;
-}): Hex => {
-  const desiredProof = ensureProof(proofs.desiredAuctionTokens, "desiredAuctionTokens");
-  const maxPriceProof = ensureProof(proofs.maxPricePerToken, "maxPricePerToken");
-  const minPaymentProof = ensureProof(proofs.minPaymentTokensFromSwap, "minPaymentTokensFromSwap");
+export const encodeIntentProofs = (
+  proofs: {
+    desiredAuctionTokens: InEProof;
+  },
+  plainIntent: AuctionIntentPlain,
+): Hex => {
+  const desiredProof = ensureProofRequiredFields(proofs.desiredAuctionTokens, "desiredAuctionTokens");
+  if (plainIntent.maxPricePerToken < 0n || plainIntent.minPaymentTokensFromSwap < 0n) {
+    throw new Error("maxPricePerToken and minPaymentTokensFromSwap must be >= 0.");
+  }
 
   return encodeAbiParameters(
-    [
-      {
-        type: "tuple",
-        components: [
-          {
-            name: "desiredAuctionTokens",
-            type: "tuple",
-            components: [
-              { name: "ctHash", type: "uint256" },
-              { name: "securityZone", type: "uint8" },
-              { name: "utype", type: "uint8" },
-              { name: "signature", type: "bytes" },
-            ],
-          },
-          {
-            name: "maxPricePerToken",
-            type: "tuple",
-            components: [
-              { name: "ctHash", type: "uint256" },
-              { name: "securityZone", type: "uint8" },
-              { name: "utype", type: "uint8" },
-              { name: "signature", type: "bytes" },
-            ],
-          },
-          {
-            name: "minPaymentTokensFromSwap",
-            type: "tuple",
-            components: [
-              { name: "ctHash", type: "uint256" },
-              { name: "securityZone", type: "uint8" },
-              { name: "utype", type: "uint8" },
-              { name: "signature", type: "bytes" },
-            ],
-          },
-        ],
-      },
-    ],
+    PROOFS_ABI,
     [
       {
         desiredAuctionTokens: desiredProof,
-        maxPricePerToken: maxPriceProof,
-        minPaymentTokensFromSwap: minPaymentProof,
+        maxPricePerToken: plainIntent.maxPricePerToken,
+        minPaymentTokensFromSwap: plainIntent.minPaymentTokensFromSwap,
       },
     ],
   );
@@ -130,11 +121,37 @@ const buildIntentViaSdk = async (
   return payload;
 };
 
+export const decodeIntentProofs = (payload: Hex): {
+  desiredAuctionTokens: InEProof;
+  maxPricePerToken: bigint;
+  minPaymentTokensFromSwap: bigint;
+} => {
+  const [decoded] = decodeAbiParameters(PROOFS_ABI, payload);
+  return {
+    desiredAuctionTokens: ensureProofRequiredFields(decoded.desiredAuctionTokens, "desiredAuctionTokens"),
+    maxPricePerToken: decoded.maxPricePerToken,
+    minPaymentTokensFromSwap: decoded.minPaymentTokensFromSwap,
+  };
+};
+
+export const deriveIntentProofsViaSdkBuilder = async (
+  intent: AuctionIntentPlain,
+  builder: HookDataBuildInput["cofheBuildAuctionIntentHookData"],
+): Promise<{
+  desiredAuctionTokens: InEProof;
+}> => {
+  const payload = await buildIntentViaSdk(intent, builder);
+  const decoded = decodeIntentProofs(payload);
+  return {
+    desiredAuctionTokens: decoded.desiredAuctionTokens,
+  };
+};
+
 export const buildHookData = async (input: HookDataBuildInput): Promise<Hex> => {
   switch (input.mode) {
     case "proofs":
-      if (!input.proofs) throw new Error("Proof mode requires three InE proof objects.");
-      return buildIntentProofs(input.proofs);
+      if (!input.proofs) throw new Error("Proof mode requires desiredAuctionTokens encrypted proof.");
+      return encodeIntentProofs(input.proofs, input.plainIntent);
     case "sdk":
       return buildIntentViaSdk(input.plainIntent, input.cofheBuildAuctionIntentHookData);
     default:

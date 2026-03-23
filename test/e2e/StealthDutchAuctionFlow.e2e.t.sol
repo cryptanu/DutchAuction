@@ -133,8 +133,8 @@ contract StealthDutchAuctionFlowE2ETest is Test {
         return abi.encode(
             StealthDutchAuctionHook.AuctionIntentEncrypted({
                 desiredAuctionTokens: _encryptUint128(desiredAuctionTokens),
-                maxPricePerToken: _encryptUint128(maxPricePerToken),
-                minPaymentTokensFromSwap: _encryptUint128(minPaymentTokensFromSwap)
+                maxPricePerToken: maxPricePerToken,
+                minPaymentTokensFromSwap: minPaymentTokensFromSwap
             })
         );
     }

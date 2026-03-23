@@ -2,6 +2,7 @@ import { mockPoolManagerAbi, stealthDutchAuctionHookAbi } from "./abi.js";
 import { AuctionClientError, assert } from "./errors.js";
 import { runHealthcheck } from "./healthcheck.js";
 import { buildHookData } from "./hookData.js";
+import { sanitizeProof } from "./proofs.js";
 import { quoteFromInputs } from "./quote.js";
 import type {
   AuctionClientConfig,
@@ -267,10 +268,10 @@ export const createAuctionClient = (config: AuctionClientConfig) => {
       async buyWithPaymentTokenEncrypted(input: {
         poolId: Hex;
         desiredAuctionTokens: InEProof;
-        maxPricePerToken: InEProof;
+        maxPricePerToken: bigint;
       }): Promise<Hex> {
-        assert(input.desiredAuctionTokens.ctHash >= 0n, "INVALID_INPUT", "desiredAuctionTokens.ctHash is required");
-        assert(input.maxPricePerToken.ctHash >= 0n, "INVALID_INPUT", "maxPricePerToken.ctHash is required");
+        const desiredAuctionTokens = sanitizeProof(input.desiredAuctionTokens, "desiredAuctionTokens");
+        assertUint128(input.maxPricePerToken, "maxPricePerToken");
 
         const walletClient = ensureWriteClient(config);
         const txHash = await walletClient.writeContract({
@@ -278,7 +279,7 @@ export const createAuctionClient = (config: AuctionClientConfig) => {
           abi: stealthDutchAuctionHookAbi,
           functionName: "buyWithPaymentTokenEncrypted",
           chain: { id: config.chainId },
-          args: [input.poolId, input.desiredAuctionTokens, input.maxPricePerToken],
+          args: [input.poolId, desiredAuctionTokens, input.maxPricePerToken],
         });
 
         return txHash;

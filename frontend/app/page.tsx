@@ -2,13 +2,14 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import toast from "react-hot-toast";
-import { Address, Hex, decodeEventLog, isAddress } from "viem";
+import { Address, Hex, decodeEventLog, isAddress, isHex } from "viem";
 import { baseSepolia } from "viem/chains";
 import {
   useAccount,
   useBlockNumber,
   usePublicClient,
   useReadContract,
+  useWalletClient,
   useWaitForTransactionReceipt,
   useWatchContractEvent,
   useWriteContract,
@@ -20,12 +21,18 @@ import {
   stealthDutchAuctionHookAbi,
 } from "~~/lib/auction/abis";
 import { auctionConfig, isAuctionConfigReady, requiredEnvKeys } from "~~/lib/auction/config";
-import { getCofheHookDataBuilder } from "~~/lib/auction/cofheAdapter";
+import {
+  getCofheHookDataBuilder,
+  installCofheInjectionHelpersOnWindow,
+  tryAutoInjectCofheHookDataBuilderFromWindow,
+} from "~~/lib/auction/cofheAdapter";
 import { createFrontendAuctionClient } from "~~/lib/auction/sdkClient";
+import { deriveIntentProofsViaCofheSdk, initializeCofheSdkBuilder } from "~~/lib/auction/cofheSdkBootstrap";
 import {
   InEProof,
   PoolKey,
   buildHookData,
+  deriveIntentProofsViaSdkBuilder,
   parseNumericInput,
   poolKeyToId,
 } from "~~/lib/auction/encoding";
@@ -35,6 +42,29 @@ const MAX_UINT256 = (1n << 256n) - 1n;
 const EVENT_LOOKBACK_BLOCKS = 80_000n;
 const MAX_LOG_QUERY_RANGE = 9_999n;
 const DEFAULT_PROOF_JSON = '{"ctHash":"0","securityZone":0,"utype":6,"signature":"0x"}';
+const TASK_MANAGER_ADDRESS = "0xeA30c4B8b44078Bbf8a6ef5b9f1eC1626C7848D9" as Address;
+
+const taskManagerVerifyInputAbi = [
+  {
+    type: "function",
+    name: "verifyInput",
+    stateMutability: "nonpayable",
+    inputs: [
+      {
+        name: "input",
+        type: "tuple",
+        components: [
+          { name: "ctHash", type: "uint256" },
+          { name: "securityZone", type: "uint8" },
+          { name: "utype", type: "uint8" },
+          { name: "signature", type: "bytes" },
+        ],
+      },
+      { name: "sender", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+] as const;
 
 type PoolAuctionTuple = readonly [Hex, Address, Address, bigint];
 type AuctionPlainStateTuple = readonly [Address, boolean, bigint, bigint, bigint, bigint, bigint, bigint, bigint];
@@ -50,36 +80,52 @@ type ActivityItem = {
 };
 
 const parseProofJson = (value: string, label: string): InEProof => {
-  let parsed: {
-    ctHash: string | number;
-    securityZone: number;
-    utype: number;
-    signature: string;
-  };
+  let parsed: unknown;
 
   try {
-    parsed = JSON.parse(value) as {
-      ctHash: string | number;
-      securityZone: number;
-      utype: number;
-      signature: string;
-    };
+    parsed = JSON.parse(value);
   } catch {
     throw new Error(`${label} JSON is invalid.`);
   }
 
-  const ctHash =
-    typeof parsed.ctHash === "number"
-      ? BigInt(parsed.ctHash)
-      : parseNumericInput(String(parsed.ctHash ?? ""), `${label}.ctHash`);
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error(`${label} must be a JSON object.`);
+  }
 
-  return {
+  const raw = parsed as Record<string, unknown>;
+  for (const field of ["ctHash", "securityZone", "utype", "signature"] as const) {
+    if (!(field in raw)) {
+      throw new Error(`${label}.${field} is required.`);
+    }
+  }
+
+  const ctHash =
+    typeof raw.ctHash === "number" ? BigInt(raw.ctHash) : parseNumericInput(String(raw.ctHash ?? ""), `${label}.ctHash`);
+
+  const proof = {
     ctHash,
-    securityZone: Number(parsed.securityZone),
-    utype: Number(parsed.utype),
-    signature: String(parsed.signature) as Hex,
+    securityZone: Number(raw.securityZone),
+    utype: Number(raw.utype),
+    signature: String(raw.signature) as Hex,
   };
+
+  if (proof.ctHash < 0n) {
+    throw new Error(`${label}.ctHash must be >= 0.`);
+  }
+  if (!Number.isInteger(proof.securityZone) || proof.securityZone < 0 || proof.securityZone > 255) {
+    throw new Error(`${label}.securityZone must be in uint8 range.`);
+  }
+  if (!Number.isInteger(proof.utype) || proof.utype < 0 || proof.utype > 255) {
+    throw new Error(`${label}.utype must be in uint8 range.`);
+  }
+  if (!isHex(proof.signature)) {
+    throw new Error(`${label}.signature must be hex bytes.`);
+  }
+
+  return proof;
 };
+
+const isProofPlaceholder = (proof: InEProof): boolean => proof.ctHash === 0n;
 
 const shortHash = (hash: Hex | undefined): string => {
   if (!hash) return "-";
@@ -166,6 +212,7 @@ const Home = () => {
   const { address: connectedAddress, chain } = useAccount();
   const { data: blockNumber } = useBlockNumber({ watch: true, chainId: baseSepolia.id });
   const publicClient = usePublicClient({ chainId: baseSepolia.id });
+  const { data: walletClient } = useWalletClient({ chainId: baseSepolia.id });
   const { writeContractAsync } = useWriteContract();
 
   const [nowSec, setNowSec] = useState<bigint>(BigInt(Math.floor(Date.now() / 1000)));
@@ -182,8 +229,6 @@ const Home = () => {
   const [minPaymentOut, setMinPaymentOut] = useState("1900");
   const [hookDataMode, setHookDataMode] = useState<HookDataMode>("proofs");
   const [desiredProof, setDesiredProof] = useState(DEFAULT_PROOF_JSON);
-  const [maxPriceProof, setMaxPriceProof] = useState(DEFAULT_PROOF_JSON);
-  const [minPaymentProof, setMinPaymentProof] = useState(DEFAULT_PROOF_JSON);
 
   const [mintToken0Amount, setMintToken0Amount] = useState("1000");
   const [mintAuctionAmount, setMintAuctionAmount] = useState("1000");
@@ -193,6 +238,8 @@ const Home = () => {
   const [pendingTxLabel, setPendingTxLabel] = useState("");
   const [sdkHealth, setSdkHealth] = useState<SdkHealthcheck | undefined>();
   const [sdkHealthError, setSdkHealthError] = useState<string | undefined>();
+  const [cofheInitError, setCofheInitError] = useState<string | undefined>();
+  const [cofheBuilderReady, setCofheBuilderReady] = useState<boolean>(Boolean(getCofheHookDataBuilder()));
 
   const createSdkClient = useCallback(() => {
     if (!publicClient || !isAuctionConfigReady) return undefined;
@@ -220,7 +267,7 @@ const Home = () => {
       },
       cofhe: builder
         ? {
-            buildAuctionIntentHookData: builder,
+            buildAuctionIntentHookData: builder
           }
         : undefined,
     });
@@ -502,6 +549,94 @@ const Home = () => {
     [connectedAddress],
   );
 
+  const resolveProofsForIntent = useCallback(
+    async (
+      plainIntent: { desiredAuctionTokens: bigint; maxPricePerToken: bigint; minPaymentTokensFromSwap: bigint },
+      verificationSender?: Address,
+    ) => {
+      const builder = getCofheHookDataBuilder();
+
+      if (hookDataMode === "proofs") {
+        const manualProofs = {
+          desiredAuctionTokens: parseProofJson(desiredProof, "desiredAuctionTokens"),
+        };
+
+        const hasPlaceholder = isProofPlaceholder(manualProofs.desiredAuctionTokens);
+
+        if (!hasPlaceholder) return manualProofs;
+
+        if (verificationSender) {
+          return deriveIntentProofsViaCofheSdk(
+            {
+              desiredAuctionTokens: plainIntent.desiredAuctionTokens.toString(),
+              maxPricePerToken: plainIntent.maxPricePerToken.toString(),
+              minPaymentTokensFromSwap: plainIntent.minPaymentTokensFromSwap.toString(),
+            },
+            verificationSender,
+          );
+        }
+
+        if (!builder) {
+          throw new Error(
+            "Desired proof is placeholder (ctHash=0). Inject a cofhe hookData builder or provide a valid encrypted proof.",
+          );
+        }
+
+        return deriveIntentProofsViaSdkBuilder(plainIntent, builder);
+      }
+
+      if (verificationSender) {
+        return deriveIntentProofsViaCofheSdk(
+          {
+            desiredAuctionTokens: plainIntent.desiredAuctionTokens.toString(),
+            maxPricePerToken: plainIntent.maxPricePerToken.toString(),
+            minPaymentTokensFromSwap: plainIntent.minPaymentTokensFromSwap.toString(),
+          },
+          verificationSender,
+        );
+      }
+
+      if (!builder) {
+        return undefined;
+      }
+
+      return deriveIntentProofsViaSdkBuilder(plainIntent, builder);
+    },
+    [desiredProof, hookDataMode],
+  );
+
+  const verifyProofsForSender = useCallback(
+    async (
+      proofs: {
+        desiredAuctionTokens: InEProof;
+      },
+      verificationSender: Address,
+    ) => {
+      if (!publicClient || !auctionConfig.hookAddress) {
+        return;
+      }
+
+      const checks: Array<[string, InEProof]> = [["desiredAuctionTokens", proofs.desiredAuctionTokens]];
+
+      for (const [label, proof] of checks) {
+        try {
+          await publicClient.readContract({
+            address: TASK_MANAGER_ADDRESS,
+            abi: taskManagerVerifyInputAbi,
+            functionName: "verifyInput",
+            args: [proof, verificationSender],
+            account: auctionConfig.hookAddress as Address,
+          });
+        } catch {
+          throw new Error(
+            `[PROOF_SIGNER_MISMATCH] ${label} proof is invalid for sender ${verificationSender}. Rebuild proofs with cofhe encrypt account set to this sender.`,
+          );
+        }
+      }
+    },
+    [publicClient],
+  );
+
   useWatchContractEvent({
     chainId: baseSepolia.id,
     address: auctionConfig.hookAddress,
@@ -544,6 +679,48 @@ const Home = () => {
     }, 1000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    installCofheInjectionHelpersOnWindow();
+
+    const syncBuilder = () => {
+      const ready = tryAutoInjectCofheHookDataBuilderFromWindow();
+      setCofheBuilderReady(ready || Boolean(getCofheHookDataBuilder()));
+    };
+
+    syncBuilder();
+    const interval = setInterval(syncBuilder, 1500);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const initCofhe = async () => {
+      if (!publicClient || !walletClient || !connectedAddress || chain?.id !== baseSepolia.id) {
+        return;
+      }
+
+      try {
+        await initializeCofheSdkBuilder(publicClient, walletClient, {
+          swapVerifierAccount: connectedAddress,
+        });
+        if (!cancelled) {
+          setCofheInitError(undefined);
+          setCofheBuilderReady(Boolean(getCofheHookDataBuilder()));
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setCofheInitError(parseError(error));
+        }
+      }
+    };
+
+    void initCofhe();
+    return () => {
+      cancelled = true;
+    };
+  }, [publicClient, walletClient, connectedAddress, chain?.id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -696,14 +873,16 @@ const Home = () => {
         }
       }
 
-      const proofs =
-        hookDataMode === "proofs"
-          ? {
-              desiredAuctionTokens: parseProofJson(desiredProof, "desiredAuctionTokens"),
-              maxPricePerToken: parseProofJson(maxPriceProof, "maxPricePerToken"),
-              minPaymentTokensFromSwap: parseProofJson(minPaymentProof, "minPaymentTokensFromSwap"),
-            }
-          : undefined;
+      if (!connectedAddress) {
+        toast.error("Connect a wallet first.");
+        return;
+      }
+
+      const swapVerificationSender = connectedAddress;
+      const proofs = await resolveProofsForIntent(plainIntent, swapVerificationSender);
+      if (proofs && swapVerificationSender) {
+        await verifyProofsForSender(proofs, swapVerificationSender);
+      }
 
       await buildHookData({
         mode: hookDataMode,
@@ -737,10 +916,15 @@ const Home = () => {
       toast.error("Frontend config is incomplete.");
       return;
     }
+    if (!connectedAddress) {
+      toast.error("Connect a wallet first.");
+      return;
+    }
 
     try {
       const desiredAuctionTokens = parseNumericInput(desiredTokens, "Desired auction tokens");
       const maxPricePerToken = parseNumericInput(maxPrice, "Max price per token");
+      const minPaymentTokensFromSwap = parseNumericInput(minPaymentOut, "Min payment tokens from swap");
       if (desiredAuctionTokens <= 0n || maxPricePerToken <= 0n) {
         toast.error("Desired amount and max price must be > 0.");
         return;
@@ -752,13 +936,17 @@ const Home = () => {
         return;
       }
 
-      if (hookDataMode !== "proofs") {
-        toast.error("Direct encrypted payment currently requires Proof mode inputs.");
+      const intent = {
+        desiredAuctionTokens,
+        maxPricePerToken,
+        minPaymentTokensFromSwap,
+      };
+      const proofs = await resolveProofsForIntent(intent, connectedAddress);
+      if (!proofs) {
+        toast.error("No proof helper available. Inject cofhe builder or provide non-placeholder encrypted proofs.");
         return;
       }
-
-      const desiredProofInput = parseProofJson(desiredProof, "desiredAuctionTokens");
-      const maxPriceProofInput = parseProofJson(maxPriceProof, "maxPricePerToken");
+      await verifyProofsForSender(proofs, connectedAddress);
 
       await runWrite("Direct buy with payment token", () =>
         writeContractAsync({
@@ -766,7 +954,7 @@ const Home = () => {
           address: auctionConfig.hookAddress!,
           abi: stealthDutchAuctionHookAbi,
           functionName: "buyWithPaymentTokenEncrypted",
-          args: [poolId, desiredProofInput, maxPriceProofInput],
+          args: [poolId, proofs.desiredAuctionTokens, maxPricePerToken],
         }),
       );
     } catch (err) {
@@ -904,8 +1092,10 @@ const Home = () => {
                   <>
                     <p className="m-0 mt-1">RPC: {sdkHealth.rpc ? "ok" : "down"}</p>
                     <p className="m-0">Hook Reachable: {sdkHealth.contractReachability.hook ? "yes" : "no"}</p>
+                    <p className="m-0">HookData Builder: {cofheBuilderReady ? "yes" : "no"}</p>
                     <p className="m-0">Decrypt View: {sdkHealth.decryptForView ? "yes" : "no"}</p>
                     <p className="m-0">Decrypt Tx: {sdkHealth.decryptForTx ? "yes" : "no"}</p>
+                    {cofheInitError && <p className="m-0 text-xs text-error">Cofhe init: {cofheInitError}</p>}
                   </>
                 ) : (
                   <p className="m-0 mt-1 text-xs text-base-content/70">{sdkHealthError ?? "Checking..."}</p>
@@ -1143,22 +1333,15 @@ const Home = () => {
 
               {hookDataMode === "proofs" && (
                 <div className="rounded-2xl border border-base-300 bg-base-200/30 p-3">
-                  <p className="m-0 text-xs text-base-content/70">Each field expects JSON: ctHash, securityZone, utype, signature.</p>
+                  <p className="m-0 text-xs text-base-content/70">
+                    JSON fields required: ctHash, securityZone, utype, signature for `desiredAuctionTokens` only. If
+                    ctHash is 0 and a cofhe builder is injected, a valid proof is auto-derived from numeric inputs.
+                  </p>
                   <div className="mt-2 grid gap-2">
                     <textarea
                       className="textarea textarea-bordered h-20"
                       value={desiredProof}
                       onChange={event => setDesiredProof(event.target.value)}
-                    />
-                    <textarea
-                      className="textarea textarea-bordered h-20"
-                      value={maxPriceProof}
-                      onChange={event => setMaxPriceProof(event.target.value)}
-                    />
-                    <textarea
-                      className="textarea textarea-bordered h-20"
-                      value={minPaymentProof}
-                      onChange={event => setMinPaymentProof(event.target.value)}
                     />
                   </div>
                 </div>
@@ -1166,7 +1349,8 @@ const Home = () => {
 
               {hookDataMode === "sdk" && (
                 <div className="rounded-2xl border border-info/40 bg-info/10 p-3 text-xs">
-                  Inject a cofhe SDK hookData builder via `injectCofheHookDataBuilder(...)` before using SDK mode.
+                  Inject a cofhe SDK hookData builder via `injectCofheHookDataBuilder(...)`. This also powers proof
+                  auto-derivation for direct buy.
                 </div>
               )}
 

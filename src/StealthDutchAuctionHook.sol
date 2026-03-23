@@ -2,7 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {FHE, ebool, euint64, euint128} from "cofhe-contracts/FHE.sol";
-import {InEuint128} from "cofhe-contracts/ICofhe.sol";
+import {EncryptedInput, InEuint128, ITaskManager, Utils} from "cofhe-contracts/ICofhe.sol";
 import {IFHERC20Encrypted} from "./interfaces/IFHERC20Encrypted.sol";
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {Currency} from "v4-core/types/Currency.sol";
@@ -15,6 +15,8 @@ import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapD
 contract StealthDutchAuctionHook is IHooks {
     using PoolIdLibrary for PoolKey;
     using BalanceDeltaLibrary for BalanceDelta;
+
+    address internal constant TASK_MANAGER_ADDRESS = 0xeA30c4B8b44078Bbf8a6ef5b9f1eC1626C7848D9;
 
     error NotOwner();
     error NotPoolManager();
@@ -55,17 +57,16 @@ contract StealthDutchAuctionHook is IHooks {
 
     struct AuctionIntentEncrypted {
         InEuint128 desiredAuctionTokens;
-        InEuint128 maxPricePerToken;
-        InEuint128 minPaymentTokensFromSwap;
+        uint128 maxPricePerToken;
+        uint128 minPaymentTokensFromSwap;
     }
 
     struct PendingPurchase {
         uint256 auctionId;
         euint128 encAuctionTokens;
-        euint128 encMaxPricePerToken;
-        euint128 encMinPaymentTokensFromSwap;
+        uint128 maxPricePerToken;
+        uint128 minPaymentTokensFromSwap;
         uint128 priceAtIntent;
-        bool processed;
     }
 
     address public immutable poolManager;
@@ -129,13 +130,19 @@ contract StealthDutchAuctionHook is IHooks {
 
         DutchAuction storage auction = auctions[auctionId];
         auction.startPrice = FHE.asEuint128(startPrice);
+        FHE.allowThis(auction.startPrice);
         auction.endPrice = FHE.asEuint128(endPrice);
+        FHE.allowThis(auction.endPrice);
         auction.startTime = FHE.asEuint64(block.timestamp);
+        FHE.allowThis(auction.startTime);
         auction.duration = FHE.asEuint64(duration);
+        FHE.allowThis(auction.duration);
         auction.totalSupply = FHE.asEuint128(supply);
+        FHE.allowThis(auction.totalSupply);
         auction.soldAmount = FHE.asEuint128(0);
         FHE.allowThis(auction.soldAmount);
         auction.isActive = FHE.asEbool(true);
+        FHE.allowThis(auction.isActive);
         auction.seller = seller;
         auction.startPricePlain = startPrice;
         auction.endPricePlain = endPrice;
@@ -215,7 +222,7 @@ contract StealthDutchAuctionHook is IHooks {
     function buyWithPaymentTokenEncrypted(
         PoolId poolId,
         InEuint128 calldata desiredAuctionTokens,
-        InEuint128 calldata maxPricePerToken
+        uint128 maxPricePerToken
     ) external returns (uint128 paymentTokensSpent) {
         AuctionPool storage pool = poolAuctions[poolId];
         if (pool.activeAuctionId == 0) revert AuctionNotActive();
@@ -225,18 +232,12 @@ contract StealthDutchAuctionHook is IHooks {
         if (!_refreshAuctionStatus(pool, auction)) revert AuctionNotActive();
 
         euint128 encAuctionTokens = FHE.asEuint128(desiredAuctionTokens);
-        euint128 encMaxPricePerToken = FHE.asEuint128(maxPricePerToken);
         uint128 price = currentPrice(auctionId);
+        if (price > maxPricePerToken) return 0;
+
         euint128 encPrice = FHE.asEuint128(price);
-        euint128 encZero = FHE.asEuint128(0);
-        ebool priceWithinLimit = FHE.lte(encPrice, encMaxPricePerToken);
-
         euint128 encRemainingSupply = FHE.sub(auction.totalSupply, auction.soldAmount);
-        euint128 encRequestedFill = FHE.min(encAuctionTokens, encRemainingSupply);
-        ebool hasNonZeroFill = FHE.not(FHE.eq(encRequestedFill, encZero));
-        ebool shouldSettle = FHE.and(priceWithinLimit, hasNonZeroFill);
-
-        euint128 encFinalFill = FHE.select(shouldSettle, encRequestedFill, encZero);
+        euint128 encFinalFill = FHE.min(encAuctionTokens, encRemainingSupply);
         euint128 encPaymentTokens = FHE.mul(encFinalFill, encPrice);
         paymentTokensSpent = 0;
 
@@ -323,20 +324,20 @@ contract StealthDutchAuctionHook is IHooks {
         }
 
         AuctionIntentEncrypted memory intent = abi.decode(hookData, (AuctionIntentEncrypted));
-        euint128 encDesiredAuctionTokens = FHE.asEuint128(intent.desiredAuctionTokens);
-        euint128 encMaxPricePerToken = FHE.asEuint128(intent.maxPricePerToken);
-        euint128 encMinPaymentTokensFromSwap = FHE.asEuint128(intent.minPaymentTokensFromSwap);
+        InEuint128 memory desiredAuctionInput = intent.desiredAuctionTokens;
+        EncryptedInput memory desiredEncryptedInput = Utils.inputFromEuint128(desiredAuctionInput);
+        uint256 desiredHandle = ITaskManager(TASK_MANAGER_ADDRESS).verifyInput(desiredEncryptedInput, sender);
+        euint128 encDesiredAuctionTokens = euint128.wrap(bytes32(desiredHandle));
         uint128 priceAtIntent = currentPrice(pool.activeAuctionId);
 
         PendingPurchase storage pending = pendingPurchases[sender][poolId];
-        if (pending.auctionId != 0 && !pending.processed) revert PendingPurchaseExists();
+        if (pending.auctionId != 0) revert PendingPurchaseExists();
 
         pending.auctionId = pool.activeAuctionId;
         pending.encAuctionTokens = encDesiredAuctionTokens;
-        pending.encMaxPricePerToken = encMaxPricePerToken;
-        pending.encMinPaymentTokensFromSwap = encMinPaymentTokensFromSwap;
+        pending.maxPricePerToken = intent.maxPricePerToken;
+        pending.minPaymentTokensFromSwap = intent.minPaymentTokensFromSwap;
         pending.priceAtIntent = priceAtIntent;
-        pending.processed = false;
 
         emit AuctionIntentRegistered(poolId, pending.auctionId, sender);
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
@@ -350,34 +351,29 @@ contract StealthDutchAuctionHook is IHooks {
         bytes calldata
     ) external override onlyPoolManager returns (bytes4, int128) {
         PoolId poolId = key.toId();
-        PendingPurchase storage pending = pendingPurchases[sender][poolId];
-        if (pending.auctionId == 0 || pending.processed) return (IHooks.afterSwap.selector, 0);
+        PendingPurchase memory pending = pendingPurchases[sender][poolId];
+        if (pending.auctionId == 0) return (IHooks.afterSwap.selector, 0);
+        delete pendingPurchases[sender][poolId];
 
         AuctionPool storage pool = poolAuctions[poolId];
         DutchAuction storage auction = auctions[pending.auctionId];
         if (!_refreshAuctionStatus(pool, auction)) {
-            delete pendingPurchases[sender][poolId];
             return (IHooks.afterSwap.selector, 0);
         }
 
         uint128 paymentOut = _extractSwapOutput(params, delta);
+        if (pending.priceAtIntent > pending.maxPricePerToken) return (IHooks.afterSwap.selector, 0);
+        if (paymentOut < pending.minPaymentTokensFromSwap) return (IHooks.afterSwap.selector, 0);
+        if (pending.priceAtIntent == 0) return (IHooks.afterSwap.selector, 0);
+        uint128 maxAffordableTokens = paymentOut / pending.priceAtIntent;
+        if (maxAffordableTokens == 0) return (IHooks.afterSwap.selector, 0);
 
-        euint128 encZero = FHE.asEuint128(0);
         euint128 encPriceAtIntent = FHE.asEuint128(pending.priceAtIntent);
-        euint128 encPaymentOut = FHE.asEuint128(paymentOut);
+        euint128 encAffordableTokens = FHE.asEuint128(maxAffordableTokens);
         euint128 encRemainingSupply = FHE.sub(auction.totalSupply, auction.soldAmount);
         euint128 encRequestedFill = FHE.min(pending.encAuctionTokens, encRemainingSupply);
-        euint128 encPaymentForFill = FHE.mul(encRequestedFill, encPriceAtIntent);
-
-        ebool hasNonZeroFill = FHE.not(FHE.eq(encRequestedFill, encZero));
-        ebool priceWithinLimit = FHE.lte(encPriceAtIntent, pending.encMaxPricePerToken);
-        ebool meetsMinPayment = FHE.gte(encPaymentOut, pending.encMinPaymentTokensFromSwap);
-        ebool hasEnoughPayment = FHE.gte(encPaymentOut, encPaymentForFill);
-        ebool shouldSettle =
-            FHE.and(FHE.and(priceWithinLimit, meetsMinPayment), FHE.and(hasNonZeroFill, hasEnoughPayment));
-
-        euint128 encFinalFill = FHE.select(shouldSettle, encRequestedFill, encZero);
-        euint128 encFinalPayment = FHE.select(shouldSettle, encPaymentForFill, encZero);
+        euint128 encFinalFill = FHE.min(encRequestedFill, encAffordableTokens);
+        euint128 encFinalPayment = FHE.mul(encFinalFill, encPriceAtIntent);
         FHE.allow(encFinalPayment, pool.paymentToken);
         FHE.allow(encFinalFill, pool.auctionToken);
 
@@ -390,10 +386,8 @@ contract StealthDutchAuctionHook is IHooks {
 
         auction.soldAmount = FHE.add(auction.soldAmount, encFinalFill);
         FHE.allowThis(auction.soldAmount);
-        pending.processed = true;
 
         emit AuctionPurchase(poolId, pending.auctionId, sender, uint64(block.timestamp));
-        delete pendingPurchases[sender][poolId];
 
         return (IHooks.afterSwap.selector, 0);
     }
@@ -453,6 +447,7 @@ contract StealthDutchAuctionHook is IHooks {
     function _deactivateAuction(AuctionPool storage pool, DutchAuction storage auction) internal {
         auction.isActivePlain = false;
         auction.isActive = FHE.asEbool(false);
+        FHE.allowThis(auction.isActive);
         pool.activeAuctionId = 0;
     }
 }

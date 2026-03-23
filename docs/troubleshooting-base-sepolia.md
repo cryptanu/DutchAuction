@@ -15,6 +15,20 @@ Common causes:
 - `minPaymentTokensFromSwap` above realistic output
 - cofhe capability mismatch on chain
 
+Known unresolved case (2026-03-23):
+
+- `swap(...)` on Base Sepolia can still revert in estimation with:
+  - `exceeds maximum per-transaction gas limit`
+  - or `exceeds max transaction gas limit`
+- This occurs even with:
+  - non-placeholder encrypted proof inputs
+  - sender-context proof wiring (`verifyInput(..., buyer)` path)
+  - persisted ACL hardening on stored encrypted state handles
+- Current status:
+  - local Foundry tests and SDK tests pass
+  - direct encrypted buy path is functional
+  - on-chain swap path remains under investigation
+
 ## `COFHE_UNAVAILABLE` or `UNSUPPORTED_DECRYPT_FLOW`
 
 - Inject `@cofhe/sdk` adapter into `createAuctionClient`.

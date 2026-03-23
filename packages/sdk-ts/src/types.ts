@@ -34,8 +34,6 @@ export type InEProof = {
 
 export type AuctionIntentProofs = {
   desiredAuctionTokens: InEProof;
-  maxPricePerToken: InEProof;
-  minPaymentTokensFromSwap: InEProof;
 };
 
 export type HookDataMode = "proofs" | "sdk";
@@ -65,7 +63,6 @@ export interface CofheAdapter {
     maxPricePerToken: string;
     minPaymentTokensFromSwap: string;
   }) => Promise<Hex> | Hex;
-  buildAuctionIntentProofHookData?: (proofs: AuctionIntentProofs) => Promise<Hex> | Hex;
   decryptForView?: (input: CofheDecryptForViewInput) => Promise<unknown>;
   decryptForTx?: (input: CofheDecryptForTxInput) => Promise<unknown>;
 }

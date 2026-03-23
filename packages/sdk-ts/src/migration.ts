@@ -20,7 +20,6 @@ export const wrapDeprecatedCofhejs = (_legacy: LegacyCofhejsLike): CofheAdapter 
 
   return {
     buildAuctionIntentHookData: async () => reject(),
-    buildAuctionIntentProofHookData: async () => reject(),
     decryptForView: async () => reject(),
     decryptForTx: async () => reject(),
   };
@@ -48,14 +47,8 @@ export const fromCofheSdk = (sdk: UnknownRecord): CofheAdapter => {
         ? ((sdk.decrypt as UnknownRecord).forTx as CofheAdapter["decryptForTx"])
         : undefined;
 
-  const buildAuctionIntentProofHookData =
-    typeof sdk.buildAuctionIntentProofHookData === "function"
-      ? (sdk.buildAuctionIntentProofHookData as CofheAdapter["buildAuctionIntentProofHookData"])
-      : undefined;
-
   return {
     buildAuctionIntentHookData,
-    buildAuctionIntentProofHookData,
     decryptForView,
     decryptForTx,
   };

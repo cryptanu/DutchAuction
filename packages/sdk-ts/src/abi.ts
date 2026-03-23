@@ -69,13 +69,7 @@ export const stealthDutchAuctionHookAbi = [
       },
       {
         name: "maxPricePerToken",
-        type: "tuple",
-        components: [
-          { name: "ctHash", type: "uint256" },
-          { name: "securityZone", type: "uint8" },
-          { name: "utype", type: "uint8" },
-          { name: "signature", type: "bytes" }
-        ]
+        type: "uint128"
       }
     ],
     outputs: [{ name: "paymentTokensSpent", type: "uint128" }]

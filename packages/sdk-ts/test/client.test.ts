@@ -215,12 +215,34 @@ test("buyWithPaymentTokenEncrypted submits encrypted direct buy tx", async () =>
   const txHash = await client.auction.buyWithPaymentTokenEncrypted({
     poolId: POOL_ID,
     desiredAuctionTokens: { ctHash: 101n, securityZone: 0, utype: 6, signature: "0x" },
-    maxPricePerToken: { ctHash: 102n, securityZone: 0, utype: 6, signature: "0x" },
+    maxPricePerToken: 102n,
   });
 
   assert.match(txHash, /^0x[0-9a-f]+$/i);
   assert.equal(config.writes.length, 1);
   assert.equal(config.writes[0]?.functionName, "buyWithPaymentTokenEncrypted");
+});
+
+test("buyWithPaymentTokenEncrypted rejects placeholder proof tuples", async () => {
+  const config = createMockConfig();
+  const client = createAuctionClient(config);
+
+  await assert.rejects(
+    () =>
+      client.auction.buyWithPaymentTokenEncrypted({
+        poolId: POOL_ID,
+        desiredAuctionTokens: { ctHash: 0n, securityZone: 0, utype: 6, signature: "0x" },
+        maxPricePerToken: 102n,
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof AuctionClientError);
+      assert.equal((error as AuctionClientError).code, "INVALID_INPUT");
+      assert.match((error as AuctionClientError).message, /ctHash must be > 0/i);
+      return true;
+    },
+  );
+
+  assert.equal(config.writes.length, 0);
 });
 
 test("decrypt flows map to explicit view/tx methods", async () => {
