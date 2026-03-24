@@ -26,6 +26,17 @@ type CofheClientLike = {
     setAccount: (account: Address) => unknown;
     execute: () => Promise<EncryptedItemInput[]>;
   };
+  decryptForTx: (ctHash: bigint | string) => {
+    setChainId: (chainId: number) => unknown;
+    setAccount: (account: Address) => unknown;
+    withoutPermit: () => {
+      execute: () => Promise<{
+        ctHash: bigint | string;
+        decryptedValue: bigint;
+        signature: Hex;
+      }>;
+    };
+  };
 };
 
 let cofheClient: CofheClientLike | undefined;
@@ -91,6 +102,27 @@ export const deriveIntentProofsViaCofheSdk = async (
   verifierAccount?: Address,
 ): Promise<IntentProofTuple> => {
   return encryptAuctionIntent(intent, verifierAccount);
+};
+
+export const decryptHandleForTxViaCofheSdk = async (
+  ctHash: bigint | string,
+  account?: Address,
+): Promise<{ decryptedValue: bigint; signature: Hex }> => {
+  if (!cofheClient) {
+    throw new Error("Cofhe SDK client is not initialized.");
+  }
+
+  const builder = cofheClient.decryptForTx(ctHash);
+  builder.setChainId(chains.baseSepolia.id);
+  if (account) {
+    builder.setAccount(account);
+  }
+
+  const result = await builder.withoutPermit().execute();
+  return {
+    decryptedValue: result.decryptedValue,
+    signature: result.signature,
+  };
 };
 
 const buildAuctionIntentHookData = async (intent: HookDataIntent): Promise<Hex> => {

@@ -27,7 +27,11 @@ import {
   tryAutoInjectCofheHookDataBuilderFromWindow,
 } from "~~/lib/auction/cofheAdapter";
 import { createFrontendAuctionClient } from "~~/lib/auction/sdkClient";
-import { deriveIntentProofsViaCofheSdk, initializeCofheSdkBuilder } from "~~/lib/auction/cofheSdkBootstrap";
+import {
+  decryptHandleForTxViaCofheSdk,
+  deriveIntentProofsViaCofheSdk,
+  initializeCofheSdkBuilder,
+} from "~~/lib/auction/cofheSdkBootstrap";
 import {
   InEProof,
   PoolKey,
@@ -43,6 +47,7 @@ const EVENT_LOOKBACK_BLOCKS = 80_000n;
 const MAX_LOG_QUERY_RANGE = 9_999n;
 const DEFAULT_PROOF_JSON = '{"ctHash":"0","securityZone":0,"utype":6,"signature":"0x"}';
 const TASK_MANAGER_ADDRESS = "0xeA30c4B8b44078Bbf8a6ef5b9f1eC1626C7848D9" as Address;
+const ZERO_HANDLE = ("0x" + "0".repeat(64)) as Hex;
 
 const taskManagerVerifyInputAbi = [
   {
@@ -69,6 +74,7 @@ const taskManagerVerifyInputAbi = [
 type PoolAuctionTuple = readonly [Hex, Address, Address, bigint];
 type AuctionPlainStateTuple = readonly [Address, boolean, bigint, bigint, bigint, bigint, bigint, bigint, bigint];
 type PoolConfigTuple = readonly [PoolKey, bigint, bigint, boolean];
+type PendingPurchaseTuple = readonly [bigint, Hex, bigint, bigint, bigint, bigint, bigint, Hex, Hex, bigint, boolean, boolean];
 type SdkHealthcheck = Awaited<ReturnType<ReturnType<typeof createFrontendAuctionClient>["healthcheck"]>>;
 
 type ActivityItem = {
@@ -77,6 +83,19 @@ type ActivityItem = {
   detail: string;
   blockNumber: bigint;
   txHash: Hex;
+};
+
+type PendingFromEvent = {
+  auctionId: bigint;
+  paymentHandle: Hex;
+  fillHandle: Hex;
+  finalizeDeadline: bigint;
+  direct: boolean;
+};
+
+const isSameAddress = (lhs?: Address, rhs?: Address): boolean => {
+  if (!lhs || !rhs) return false;
+  return lhs.toLowerCase() === rhs.toLowerCase();
 };
 
 const parseProofJson = (value: string, label: string): InEProof => {
@@ -177,6 +196,16 @@ const toActivity = (
         txHash,
       };
     }
+    case "AuctionSettlementReady": {
+      const args = decoded.args as { auctionId: bigint; buyer: Address; finalizeDeadline: bigint; direct: boolean };
+      return {
+        id: `${txHash}-${logIndex.toString()}`,
+        title: "Settlement pending finalize",
+        detail: `${shortAddress(args.buyer)} pending #${args.auctionId.toString()} (${args.direct ? "direct" : "swap"}) until ${args.finalizeDeadline.toString()}`,
+        blockNumber,
+        txHash,
+      };
+    }
     case "AuctionSoldOut": {
       const args = decoded.args as { auctionId: bigint };
       return {
@@ -240,6 +269,7 @@ const Home = () => {
   const [sdkHealthError, setSdkHealthError] = useState<string | undefined>();
   const [cofheInitError, setCofheInitError] = useState<string | undefined>();
   const [cofheBuilderReady, setCofheBuilderReady] = useState<boolean>(Boolean(getCofheHookDataBuilder()));
+  const [pendingFromEvent, setPendingFromEvent] = useState<PendingFromEvent | undefined>();
 
   const createSdkClient = useCallback(() => {
     if (!publicClient || !isAuctionConfigReady) return undefined;
@@ -438,12 +468,49 @@ const Home = () => {
     },
   });
 
+  const { data: pendingPurchaseRaw, error: pendingPurchaseError, refetch: refetchPendingPurchase } = useReadContract({
+    chainId: baseSepolia.id,
+    address: auctionConfig.hookAddress,
+    abi: stealthDutchAuctionHookAbi,
+    functionName: "getPendingPurchase",
+    args: connectedAddress && poolId ? [connectedAddress, poolId] : undefined,
+    query: {
+      enabled: Boolean(connectedAddress && poolId && auctionConfig.hookAddress),
+      refetchInterval: 4000,
+    },
+  });
+
   const token0Balance = (token0BalanceRaw as bigint | undefined) ?? 0n;
   const paymentBalance = (paymentBalanceRaw as bigint | undefined) ?? 0n;
   const auctionBalance = (auctionBalanceRaw as bigint | undefined) ?? 0n;
   const token0AllowancePool = (token0AllowancePoolRaw as bigint | undefined) ?? 0n;
   const paymentAllowanceHook = (paymentAllowanceHookRaw as bigint | undefined) ?? 0n;
   const auctionAllowanceHook = (auctionAllowanceHookRaw as bigint | undefined) ?? 0n;
+  const pendingPurchase = pendingPurchaseRaw as PendingPurchaseTuple | undefined;
+  const pendingAuctionId = pendingPurchase?.[0] ?? 0n;
+  const pendingFillHandle = pendingPurchase?.[7] ?? ZERO_HANDLE;
+  const pendingPaymentHandle = pendingPurchase?.[8] ?? ZERO_HANDLE;
+  const pendingFinalizeDeadline = pendingPurchase?.[9] ?? 0n;
+  const pendingReady = pendingPurchase?.[10] ?? false;
+  const pendingReadErrorText = pendingPurchaseError ? parseError(pendingPurchaseError) : undefined;
+  const pendingFeatureUnsupported = Boolean(
+    pendingReadErrorText &&
+      /function|selector|revert|unknown|not found|does not exist/i.test(pendingReadErrorText.toLowerCase()),
+  );
+  const activePendingFromEvent =
+    pendingFromEvent && pendingFromEvent.finalizeDeadline > nowSec ? pendingFromEvent : undefined;
+
+  const contractPendingReady =
+    pendingReady && pendingAuctionId > 0n && pendingPaymentHandle !== ZERO_HANDLE && pendingFillHandle !== ZERO_HANDLE;
+  const effectivePendingAuctionId = contractPendingReady ? pendingAuctionId : (activePendingFromEvent?.auctionId ?? 0n);
+  const effectivePendingFillHandle =
+    contractPendingReady ? pendingFillHandle : (activePendingFromEvent?.fillHandle ?? ZERO_HANDLE);
+  const effectivePendingPaymentHandle =
+    contractPendingReady ? pendingPaymentHandle : (activePendingFromEvent?.paymentHandle ?? ZERO_HANDLE);
+  const effectivePendingFinalizeDeadline =
+    contractPendingReady ? pendingFinalizeDeadline : (activePendingFromEvent?.finalizeDeadline ?? 0n);
+  const effectivePendingReady = contractPendingReady || Boolean(activePendingFromEvent);
+  const effectivePendingSource = contractPendingReady ? "contract" : activePendingFromEvent ? "event" : "-";
 
   const { isLoading: txIsConfirming, isSuccess: txConfirmed, isError: txFailed, error: txError } =
     useWaitForTransactionReceipt({
@@ -455,6 +522,7 @@ const Home = () => {
   const refreshActivity = useCallback(async () => {
     if (!publicClient || !auctionConfig.hookAddress) {
       setActivity([]);
+      setPendingFromEvent(undefined);
       return;
     }
 
@@ -477,32 +545,121 @@ const Home = () => {
         chunkFrom = chunkTo + 1n;
       }
 
-      const parsed = logs
-        .map(log => {
-          try {
-            if (!log.transactionHash) return undefined;
-            const decoded = decodeEventLog({
-              abi: stealthDutchAuctionHookAbi,
-              data: log.data,
-              topics: log.topics,
-            });
+      const decodedLogs: Array<{
+        decoded: { eventName: string; args: unknown };
+        txHash: Hex;
+        blockNumber: bigint;
+        logIndex: bigint;
+      }> = [];
+      for (const log of logs) {
+        try {
+          if (!log.transactionHash) continue;
+          const decoded = decodeEventLog({
+            abi: stealthDutchAuctionHookAbi,
+            data: log.data,
+            topics: log.topics,
+          }) as { eventName: string; args: unknown };
+          decodedLogs.push({
+            decoded,
+            txHash: log.transactionHash,
+            blockNumber: log.blockNumber ?? 0n,
+            logIndex: BigInt(log.logIndex ?? 0),
+          });
+        } catch {
+          continue;
+        }
+      }
 
-            return toActivity(decoded, log.transactionHash, log.blockNumber ?? 0n, BigInt(log.logIndex ?? 0));
-          } catch {
-            return undefined;
-          }
-        })
-        .filter((item): item is ActivityItem => item !== undefined)
+      const parsed = decodedLogs
+        .map(item => toActivity(item.decoded, item.txHash, item.blockNumber, item.logIndex))
         .sort((a, b) => {
           if (a.blockNumber === b.blockNumber) return a.id < b.id ? 1 : -1;
           return a.blockNumber < b.blockNumber ? 1 : -1;
         });
 
       setActivity(parsed.slice(0, 25));
+
+      if (!connectedAddress) {
+        setPendingFromEvent(undefined);
+      } else {
+        const pendingByAuction = new Map<
+          string,
+          PendingFromEvent & {
+            blockNumber: bigint;
+            logIndex: bigint;
+          }
+        >();
+        const asc = [...decodedLogs].sort((a, b) => {
+          if (a.blockNumber === b.blockNumber) return a.logIndex < b.logIndex ? -1 : 1;
+          return a.blockNumber < b.blockNumber ? -1 : 1;
+        });
+
+        for (const item of asc) {
+          if (item.decoded.eventName === "AuctionSettlementReady") {
+            const args = item.decoded.args as {
+              auctionId: bigint;
+              buyer: Address;
+              paymentHandle: bigint;
+              fillHandle: bigint;
+              finalizeDeadline: bigint;
+              direct: boolean;
+            };
+            if (!isSameAddress(args.buyer, connectedAddress)) continue;
+            pendingByAuction.set(args.auctionId.toString(), {
+              auctionId: args.auctionId,
+              paymentHandle: (`0x${args.paymentHandle.toString(16).padStart(64, "0")}`) as Hex,
+              fillHandle: (`0x${args.fillHandle.toString(16).padStart(64, "0")}`) as Hex,
+              finalizeDeadline: args.finalizeDeadline,
+              direct: args.direct,
+              blockNumber: item.blockNumber,
+              logIndex: item.logIndex,
+            });
+            continue;
+          }
+
+          if (item.decoded.eventName === "AuctionPurchase") {
+            const args = item.decoded.args as { auctionId: bigint; buyer: Address };
+            if (!isSameAddress(args.buyer, connectedAddress)) continue;
+            pendingByAuction.delete(args.auctionId.toString());
+          }
+        }
+
+        let latestPending:
+          | (PendingFromEvent & {
+              blockNumber: bigint;
+              logIndex: bigint;
+            })
+          | undefined;
+        for (const candidate of pendingByAuction.values()) {
+          if (!latestPending) {
+            latestPending = candidate;
+            continue;
+          }
+          if (candidate.blockNumber > latestPending.blockNumber) {
+            latestPending = candidate;
+            continue;
+          }
+          if (candidate.blockNumber === latestPending.blockNumber && candidate.logIndex > latestPending.logIndex) {
+            latestPending = candidate;
+          }
+        }
+
+        if (!latestPending) {
+          setPendingFromEvent(undefined);
+        } else {
+          setPendingFromEvent({
+            auctionId: latestPending.auctionId,
+            paymentHandle: latestPending.paymentHandle,
+            fillHandle: latestPending.fillHandle,
+            finalizeDeadline: latestPending.finalizeDeadline,
+            direct: latestPending.direct,
+          });
+        }
+      }
     } catch (err) {
       toast.error(parseError(err));
     }
-  }, [publicClient, auctionConfig.hookAddress, blockNumber]);
+  }, [publicClient, auctionConfig.hookAddress, blockNumber, connectedAddress]);
 
   const refreshContractReads = useCallback(async () => {
     await Promise.all([
@@ -516,6 +673,7 @@ const Home = () => {
       refetchToken0Allowance(),
       refetchPaymentAllowance(),
       refetchAuctionAllowance(),
+      refetchPendingPurchase(),
     ]);
   }, [
     refetchPoolAuction,
@@ -528,6 +686,7 @@ const Home = () => {
     refetchToken0Allowance,
     refetchPaymentAllowance,
     refetchAuctionAllowance,
+    refetchPendingPurchase,
   ]);
 
   const runWrite = useCallback(
@@ -670,6 +829,8 @@ const Home = () => {
           })
           .slice(0, 25);
       });
+
+      void refreshActivity();
     },
   });
 
@@ -897,7 +1058,7 @@ const Home = () => {
         return;
       }
 
-      await runWrite("Swap + auction purchase", () =>
+      await runWrite("Swap + register intent", () =>
         sdkClient.auction.swapAndBuy({
           poolId,
           swapInput: amountIn,
@@ -948,13 +1109,71 @@ const Home = () => {
       }
       await verifyProofsForSender(proofs, connectedAddress);
 
-      await runWrite("Direct buy with payment token", () =>
+      await runWrite("Direct buy + register intent", () =>
         writeContractAsync({
           chainId: baseSepolia.id,
           address: auctionConfig.hookAddress!,
           abi: stealthDutchAuctionHookAbi,
           functionName: "buyWithPaymentTokenEncrypted",
           args: [poolId, proofs.desiredAuctionTokens, maxPricePerToken],
+        }),
+      );
+    } catch (err) {
+      toast.error(parseError(err));
+    }
+  };
+
+  const onFinalizePendingPurchase = async () => {
+    if (!connectedAddress) {
+      toast.error("Connect a wallet first.");
+      return;
+    }
+    if (!poolId) {
+      toast.error("Pool is not configured.");
+      return;
+    }
+    if (pendingFeatureUnsupported) {
+      toast.error(
+        "Current hook deployment does not expose pending-settlement reads. Redeploy latest 2-step hook and update frontend env.",
+      );
+      return;
+    }
+    if (!effectivePendingReady || effectivePendingAuctionId === 0n) {
+      toast.error("No ready pending purchase for this wallet.");
+      return;
+    }
+    if (effectivePendingPaymentHandle === ZERO_HANDLE || effectivePendingFillHandle === ZERO_HANDLE) {
+      toast.error("Pending settlement handles are missing.");
+      return;
+    }
+    if (!publicClient || !walletClient) {
+      toast.error("Wallet client unavailable.");
+      return;
+    }
+
+    try {
+      await initializeCofheSdkBuilder(publicClient, walletClient, { swapVerifierAccount: connectedAddress });
+
+      const paymentProof = await decryptHandleForTxViaCofheSdk(BigInt(effectivePendingPaymentHandle), connectedAddress);
+      const fillProof = await decryptHandleForTxViaCofheSdk(BigInt(effectivePendingFillHandle), connectedAddress);
+
+      const sdkClient = createSdkClient();
+      if (!sdkClient) {
+        toast.error("SDK client unavailable.");
+        return;
+      }
+
+      await runWrite("Finalize pending purchase", () =>
+        sdkClient.auction.finalizePendingPurchase({
+          poolId,
+          paymentProof: {
+            value: paymentProof.decryptedValue,
+            signature: paymentProof.signature,
+          },
+          fillProof: {
+            value: fillProof.decryptedValue,
+            signature: fillProof.signature,
+          },
         }),
       );
     } catch (err) {
@@ -978,7 +1197,7 @@ const Home = () => {
               <p className="m-0 text-xs uppercase tracking-[0.18em] text-base-content/60">Base Sepolia Deployment</p>
               <h1 className="m-0 text-3xl font-semibold tracking-tight">Stealth Dutch Auction Interface</h1>
               <p className="mb-0 mt-2 text-sm text-base-content/70">
-                Swap `token0` into payment token and settle auction allocation in the same transaction through the hook.
+                Step 1 registers encrypted intent on swap. Step 2 finalizes settlement with decrypt-for-tx proofs.
               </p>
             </div>
             <div className="grid gap-2 text-xs text-base-content/80">
@@ -1287,7 +1506,7 @@ const Home = () => {
           <section className="rounded-3xl border border-base-300 bg-base-100 p-6 shadow-xl shadow-base-300/40">
             <div className="mb-4 flex items-center justify-between gap-4">
               <h2 className="m-0 text-xl font-semibold">Buyer Swap + Auction Intent</h2>
-              <span className="rounded-full bg-base-200 px-3 py-1 text-xs">One transaction flow</span>
+              <span className="rounded-full bg-base-200 px-3 py-1 text-xs">Two-step settlement flow</span>
             </div>
 
             <form className="grid gap-3" onSubmit={onSwapAndBuy}>
@@ -1355,7 +1574,7 @@ const Home = () => {
               )}
 
               <button className="btn btn-primary mt-2" type="submit" disabled={txIsConfirming || !isAuctionConfigReady}>
-                Execute Swap + Auction Buy
+                Step 1: Execute Swap + Register Intent
               </button>
               <button
                 className="btn btn-secondary"
@@ -1363,7 +1582,42 @@ const Home = () => {
                 onClick={() => void onDirectBuyWithPaymentToken()}
                 disabled={txIsConfirming || !isAuctionConfigReady || !auctionIsActive}
               >
-                Direct Buy With Payment Token
+                Step 1: Direct Buy + Register Intent
+              </button>
+              <div className="mt-2 rounded-2xl border border-base-300 bg-base-200/30 p-3 text-xs">
+                <p className="m-0 font-semibold">Pending Settlement</p>
+                <p className="m-0 mt-1">Source: {effectivePendingSource}</p>
+                <p className="m-0">Auction: {formatInt(effectivePendingAuctionId)}</p>
+                <p className="m-0">Ready: {effectivePendingReady ? "yes" : "no"}</p>
+                <p className="m-0">Fill Handle: {shortHash(effectivePendingFillHandle)}</p>
+                <p className="m-0">Payment Handle: {shortHash(effectivePendingPaymentHandle)}</p>
+                <p className="m-0">
+                  Finalize Deadline: {effectivePendingFinalizeDeadline > 0n ? effectivePendingFinalizeDeadline.toString() : "-"}
+                </p>
+                {pendingReadErrorText && (
+                  <p className="m-0 mt-1 text-warning">Pending read error: {pendingReadErrorText}</p>
+                )}
+                {pendingFeatureUnsupported && (
+                  <p className="m-0 mt-1 text-warning">
+                    This deployment is missing 2-step pending APIs. Step 2 will remain disabled until you redeploy latest hook.
+                  </p>
+                )}
+              </div>
+              <button
+                className="btn btn-accent"
+                type="button"
+                onClick={() => void onFinalizePendingPurchase()}
+                disabled={
+                  txIsConfirming ||
+                  !isAuctionConfigReady ||
+                  pendingFeatureUnsupported ||
+                  !effectivePendingReady ||
+                  effectivePendingAuctionId === 0n ||
+                  effectivePendingPaymentHandle === ZERO_HANDLE ||
+                  effectivePendingFillHandle === ZERO_HANDLE
+                }
+              >
+                Step 2: Finalize Pending Purchase
               </button>
             </form>
           </section>

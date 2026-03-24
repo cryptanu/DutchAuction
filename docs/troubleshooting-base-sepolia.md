@@ -29,6 +29,20 @@ Known unresolved case (2026-03-23):
   - direct encrypted buy path is functional
   - on-chain swap path remains under investigation
 
+## `transferFromEncrypted` fix in progress
+
+Current status (2026-03-23):
+
+- `MockFHERC20.transferFromEncrypted(...)` no longer hard-reverts on not-ready decrypt result.
+- It uses `getDecryptResultSafe(...)` and returns early when decrypt result is unavailable.
+
+Important caveat:
+
+- When decrypt result is available, transfer/allowance logic still computes with decrypted `amount`.
+- This is a value leak surface and is not the final privacy-safe architecture.
+
+See: `docs/transferFromEncrypted-fix-in-progress.md`
+
 ## `COFHE_UNAVAILABLE` or `UNSUPPORTED_DECRYPT_FLOW`
 
 - Inject `@cofhe/sdk` adapter into `createAuctionClient`.

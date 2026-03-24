@@ -118,6 +118,7 @@ NEXT_PUBLIC_BASE_SEPOLIA_RPC_URL=https://sepolia.base.org
 - Migration: `docs/migration-cofhejs-to-cofhe-sdk.md`
 - Contract/Event reference: `docs/contract-events-reference.md`
 - Troubleshooting: `docs/troubleshooting-base-sepolia.md`
+- `transferFromEncrypted` fix-in-progress: `docs/transferFromEncrypted-fix-in-progress.md`
 - Integrator use-cases: `docs/integrator-use-cases.md`
 - Support model: `docs/support-model.md`
 
@@ -132,6 +133,9 @@ NEXT_PUBLIC_BASE_SEPOLIA_RPC_URL=https://sepolia.base.org
 - No logic was copied from the external repository reference; implementation was built from architecture requirements.
 - v1 is SDK-first and self-serve. Plugin packaging is deferred to v2.
 - Legacy `cofhejs` pathways are fail-closed; migration target is `@cofhe/sdk`.
+- Fix in progress (as of 2026-03-23): `transferFromEncrypted` now avoids hard failure when decrypt result is not ready
+  by using `getDecryptResultSafe(...)`, but settlement still computes with decrypted amount when available (allowance
+  update + `_transfer`), which is a privacy leak surface. See `docs/transferFromEncrypted-fix-in-progress.md`.
 - Known issue (as of 2026-03-23): swap + hook settlement on Base Sepolia can still revert during gas estimation with
   `exceeds max transaction gas limit` even after sender-context and ACL hardening patches. Direct encrypted buy and
   local/unit/e2e tests pass; on-chain swap investigation remains open.

@@ -6,6 +6,7 @@ import { sanitizeProof } from "./proofs.js";
 import { quoteFromInputs } from "./quote.js";
 import type {
   AuctionClientConfig,
+  DecryptProofPayload,
   AuctionHealthcheck,
   AuctionIntentPlain,
   AuctionState,
@@ -16,6 +17,7 @@ import type {
   QuoteSwapIntentResult,
   SwapAndBuyParams,
   PoolKey,
+  PendingPurchase,
 } from "./types.js";
 import { BASE_SEPOLIA_CHAIN_ID } from "./types.js";
 import { assertUint128 } from "./utils.js";
@@ -40,6 +42,20 @@ type AuctionEncryptedTuple = readonly [
   boolean,
 ];
 type PoolConfigTuple = readonly [PoolKey, bigint, bigint, boolean];
+type PendingPurchaseTuple = readonly [
+  bigint,
+  Hex,
+  bigint,
+  bigint,
+  bigint,
+  bigint,
+  bigint,
+  Hex,
+  Hex,
+  bigint,
+  boolean,
+  boolean,
+];
 
 const toPoolKey = (config: AuctionClientConfig): PoolKey => {
   return {
@@ -190,6 +206,34 @@ const quoteSwapIntent = async (
   });
 };
 
+const readPendingPurchase = async (
+  config: AuctionClientConfig,
+  poolId: Hex,
+  buyer: Hex,
+): Promise<PendingPurchase> => {
+  const pending = (await config.publicClient.readContract({
+    address: config.addresses.hookAddress,
+    abi: stealthDutchAuctionHookAbi,
+    functionName: "getPendingPurchase",
+    args: [buyer, poolId],
+  })) as PendingPurchaseTuple;
+
+  return {
+    auctionId: pending[0],
+    encAuctionTokensHandle: pending[1],
+    maxPricePerToken: pending[2],
+    minPaymentTokensFromSwap: pending[3],
+    priceAtIntent: pending[4],
+    paymentOut: pending[5],
+    maxAffordableTokens: pending[6],
+    encFinalFillHandle: pending[7],
+    encFinalPaymentHandle: pending[8],
+    finalizeDeadline: pending[9],
+    ready: pending[10],
+    direct: pending[11],
+  };
+};
+
 export const createAuctionClient = (config: AuctionClientConfig) => {
   ensureBaseSepolia(config.chainId);
 
@@ -252,6 +296,44 @@ export const createAuctionClient = (config: AuctionClientConfig) => {
           ],
         });
 
+        return txHash;
+      },
+      async getPendingPurchase(input: { poolId: Hex; buyer?: Hex }): Promise<PendingPurchase> {
+        const buyer =
+          input.buyer ??
+          (typeof config.walletClient?.account === "string"
+            ? config.walletClient.account
+            : config.walletClient?.account?.address);
+        if (!buyer) {
+          throw new AuctionClientError(
+            "WALLET_UNAVAILABLE",
+            "buyer address is required when wallet account is unavailable.",
+          );
+        }
+        return readPendingPurchase(config, input.poolId, buyer as Hex);
+      },
+      async finalizePendingPurchase(input: {
+        poolId: Hex;
+        paymentProof: DecryptProofPayload;
+        fillProof: DecryptProofPayload;
+      }): Promise<Hex> {
+        assertUint128(input.paymentProof.value, "paymentProof.value");
+        assertUint128(input.fillProof.value, "fillProof.value");
+
+        const walletClient = ensureWriteClient(config);
+        const txHash = await walletClient.writeContract({
+          address: config.addresses.hookAddress,
+          abi: stealthDutchAuctionHookAbi,
+          functionName: "finalizePendingPurchase",
+          chain: { id: config.chainId },
+          args: [
+            input.poolId,
+            input.paymentProof.value,
+            input.paymentProof.signature,
+            input.fillProof.value,
+            input.fillProof.signature,
+          ],
+        });
         return txHash;
       },
       async buyWithPaymentToken(input: {

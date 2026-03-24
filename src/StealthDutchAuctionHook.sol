@@ -26,9 +26,12 @@ contract StealthDutchAuctionHook is IHooks {
     error AuctionNotFound();
     error AuctionNotActive();
     error PendingPurchaseExists();
+    error PendingPurchaseNotReady();
+    error PendingPurchaseExpired();
     error PaymentTransferFailed();
     error AuctionTransferFailed();
     error PlaintextIntentDisabled();
+    error InvalidDecryptProof();
 
     struct AuctionPool {
         PoolId poolId;
@@ -67,6 +70,13 @@ contract StealthDutchAuctionHook is IHooks {
         uint128 maxPricePerToken;
         uint128 minPaymentTokensFromSwap;
         uint128 priceAtIntent;
+        uint128 paymentOut;
+        uint128 maxAffordableTokens;
+        euint128 encFinalFill;
+        euint128 encFinalPayment;
+        uint64 finalizeDeadline;
+        bool ready;
+        bool direct;
     }
 
     address public immutable poolManager;
@@ -80,9 +90,20 @@ contract StealthDutchAuctionHook is IHooks {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event PoolAuctionInitialized(PoolId indexed poolId, uint256 indexed auctionId, address indexed seller);
     event AuctionIntentRegistered(PoolId indexed poolId, uint256 indexed auctionId, address indexed buyer);
+    event AuctionSettlementReady(
+        PoolId indexed poolId,
+        uint256 indexed auctionId,
+        address indexed buyer,
+        uint256 paymentHandle,
+        uint256 fillHandle,
+        uint64 finalizeDeadline,
+        bool direct
+    );
     event AuctionPurchase(PoolId indexed poolId, uint256 indexed auctionId, address indexed buyer, uint64 timestamp);
     event AuctionSoldOut(PoolId indexed poolId, uint256 indexed auctionId);
     event AuctionExpired(PoolId indexed poolId, uint256 indexed auctionId);
+
+    uint64 public constant FINALIZE_WINDOW = 30 minutes;
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -218,7 +239,7 @@ contract StealthDutchAuctionHook is IHooks {
     }
 
     /// @notice Buy auction tokens directly with FHERC20 payment token (no pool swap leg).
-    /// @dev Inputs are encrypted and verified through cofhe TaskManager.
+    /// @dev Inputs are encrypted and verified through cofhe TaskManager. Settlement is finalized in a second tx.
     function buyWithPaymentTokenEncrypted(
         PoolId poolId,
         InEuint128 calldata desiredAuctionTokens,
@@ -231,6 +252,9 @@ contract StealthDutchAuctionHook is IHooks {
         DutchAuction storage auction = auctions[auctionId];
         if (!_refreshAuctionStatus(pool, auction)) revert AuctionNotActive();
 
+        PendingPurchase storage pending = pendingPurchases[msg.sender][poolId];
+        if (pending.auctionId != 0) revert PendingPurchaseExists();
+
         euint128 encAuctionTokens = FHE.asEuint128(desiredAuctionTokens);
         uint128 price = currentPrice(auctionId);
         if (price > maxPricePerToken) return 0;
@@ -239,22 +263,32 @@ contract StealthDutchAuctionHook is IHooks {
         euint128 encRemainingSupply = FHE.sub(auction.totalSupply, auction.soldAmount);
         euint128 encFinalFill = FHE.min(encAuctionTokens, encRemainingSupply);
         euint128 encPaymentTokens = FHE.mul(encFinalFill, encPrice);
+        FHE.allow(encPaymentTokens, msg.sender);
+        FHE.allow(encFinalFill, msg.sender);
+        pending.auctionId = auctionId;
+        pending.encAuctionTokens = encAuctionTokens;
+        pending.maxPricePerToken = maxPricePerToken;
+        pending.minPaymentTokensFromSwap = 0;
+        pending.priceAtIntent = price;
+        pending.paymentOut = 0;
+        pending.maxAffordableTokens = type(uint128).max;
+        pending.encFinalFill = encFinalFill;
+        pending.encFinalPayment = encPaymentTokens;
+        pending.finalizeDeadline = _finalizeDeadline();
+        pending.ready = true;
+        pending.direct = true;
+
+        emit AuctionIntentRegistered(poolId, auctionId, msg.sender);
+        emit AuctionSettlementReady(
+            poolId,
+            auctionId,
+            msg.sender,
+            uint256(euint128.unwrap(encPaymentTokens)),
+            uint256(euint128.unwrap(encFinalFill)),
+            pending.finalizeDeadline,
+            true
+        );
         paymentTokensSpent = 0;
-
-        FHE.allow(encPaymentTokens, pool.paymentToken);
-        FHE.allow(encFinalFill, pool.auctionToken);
-
-        if (!_transferFromEncrypted(pool.paymentToken, msg.sender, auction.seller, encPaymentTokens)) {
-            revert PaymentTransferFailed();
-        }
-        if (!_transferFromEncrypted(pool.auctionToken, auction.seller, msg.sender, encFinalFill)) {
-            revert AuctionTransferFailed();
-        }
-
-        auction.soldAmount = FHE.add(auction.soldAmount, encFinalFill);
-        FHE.allowThis(auction.soldAmount);
-
-        emit AuctionPurchase(poolId, auctionId, msg.sender, uint64(block.timestamp));
     }
 
     function beforeInitialize(address, PoolKey calldata, uint160) external pure override returns (bytes4) {
@@ -338,6 +372,13 @@ contract StealthDutchAuctionHook is IHooks {
         pending.maxPricePerToken = intent.maxPricePerToken;
         pending.minPaymentTokensFromSwap = intent.minPaymentTokensFromSwap;
         pending.priceAtIntent = priceAtIntent;
+        pending.paymentOut = 0;
+        pending.maxAffordableTokens = 0;
+        pending.encFinalFill = euint128.wrap(bytes32(0));
+        pending.encFinalPayment = euint128.wrap(bytes32(0));
+        pending.finalizeDeadline = 0;
+        pending.ready = false;
+        pending.direct = false;
 
         emit AuctionIntentRegistered(poolId, pending.auctionId, sender);
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
@@ -351,22 +392,34 @@ contract StealthDutchAuctionHook is IHooks {
         bytes calldata
     ) external override onlyPoolManager returns (bytes4, int128) {
         PoolId poolId = key.toId();
-        PendingPurchase memory pending = pendingPurchases[sender][poolId];
+        PendingPurchase storage pending = pendingPurchases[sender][poolId];
         if (pending.auctionId == 0) return (IHooks.afterSwap.selector, 0);
-        delete pendingPurchases[sender][poolId];
 
         AuctionPool storage pool = poolAuctions[poolId];
         DutchAuction storage auction = auctions[pending.auctionId];
         if (!_refreshAuctionStatus(pool, auction)) {
+            delete pendingPurchases[sender][poolId];
             return (IHooks.afterSwap.selector, 0);
         }
 
         uint128 paymentOut = _extractSwapOutput(params, delta);
-        if (pending.priceAtIntent > pending.maxPricePerToken) return (IHooks.afterSwap.selector, 0);
-        if (paymentOut < pending.minPaymentTokensFromSwap) return (IHooks.afterSwap.selector, 0);
-        if (pending.priceAtIntent == 0) return (IHooks.afterSwap.selector, 0);
+        if (pending.priceAtIntent > pending.maxPricePerToken) {
+            delete pendingPurchases[sender][poolId];
+            return (IHooks.afterSwap.selector, 0);
+        }
+        if (paymentOut < pending.minPaymentTokensFromSwap) {
+            delete pendingPurchases[sender][poolId];
+            return (IHooks.afterSwap.selector, 0);
+        }
+        if (pending.priceAtIntent == 0) {
+            delete pendingPurchases[sender][poolId];
+            return (IHooks.afterSwap.selector, 0);
+        }
         uint128 maxAffordableTokens = paymentOut / pending.priceAtIntent;
-        if (maxAffordableTokens == 0) return (IHooks.afterSwap.selector, 0);
+        if (maxAffordableTokens == 0) {
+            delete pendingPurchases[sender][poolId];
+            return (IHooks.afterSwap.selector, 0);
+        }
 
         euint128 encPriceAtIntent = FHE.asEuint128(pending.priceAtIntent);
         euint128 encAffordableTokens = FHE.asEuint128(maxAffordableTokens);
@@ -374,22 +427,97 @@ contract StealthDutchAuctionHook is IHooks {
         euint128 encRequestedFill = FHE.min(pending.encAuctionTokens, encRemainingSupply);
         euint128 encFinalFill = FHE.min(encRequestedFill, encAffordableTokens);
         euint128 encFinalPayment = FHE.mul(encFinalFill, encPriceAtIntent);
-        FHE.allow(encFinalPayment, pool.paymentToken);
-        FHE.allow(encFinalFill, pool.auctionToken);
+        FHE.allow(encFinalPayment, sender);
+        FHE.allow(encFinalFill, sender);
+        pending.paymentOut = paymentOut;
+        pending.maxAffordableTokens = maxAffordableTokens;
+        pending.encFinalFill = encFinalFill;
+        pending.encFinalPayment = encFinalPayment;
+        pending.finalizeDeadline = _finalizeDeadline();
+        pending.ready = true;
+        pending.direct = false;
 
-        if (!_transferFromEncrypted(pool.paymentToken, sender, auction.seller, encFinalPayment)) {
+        emit AuctionSettlementReady(
+            poolId,
+            pending.auctionId,
+            sender,
+            uint256(euint128.unwrap(encFinalPayment)),
+            uint256(euint128.unwrap(encFinalFill)),
+            pending.finalizeDeadline,
+            false
+        );
+
+        return (IHooks.afterSwap.selector, 0);
+    }
+
+    function finalizePendingPurchase(
+        PoolId poolId,
+        uint128 paymentResult,
+        bytes calldata paymentSignature,
+        uint128 fillResult,
+        bytes calldata fillSignature
+    ) external returns (uint128 paymentTokensSpent, uint128 auctionTokensFilled) {
+        PendingPurchase storage pending = pendingPurchases[msg.sender][poolId];
+        if (pending.auctionId == 0 || !pending.ready) revert PendingPurchaseNotReady();
+        uint256 pendingAuctionId = pending.auctionId;
+        if (block.timestamp > pending.finalizeDeadline) {
+            delete pendingPurchases[msg.sender][poolId];
+            revert PendingPurchaseExpired();
+        }
+
+        AuctionPool storage pool = poolAuctions[poolId];
+        DutchAuction storage auction = auctions[pendingAuctionId];
+        if (!_refreshAuctionStatus(pool, auction)) {
+            delete pendingPurchases[msg.sender][poolId];
+            revert AuctionNotActive();
+        }
+
+        if (pending.priceAtIntent == 0) revert InvalidDecryptProof();
+        if (pending.paymentOut != 0 && paymentResult > pending.paymentOut) revert InvalidDecryptProof();
+        if (pending.maxAffordableTokens != 0 && fillResult > pending.maxAffordableTokens) revert InvalidDecryptProof();
+
+        uint256 expectedPayment = uint256(fillResult) * uint256(pending.priceAtIntent);
+        if (expectedPayment > type(uint128).max) revert InvalidDecryptProof();
+        if (paymentResult != uint128(expectedPayment)) revert InvalidDecryptProof();
+
+        uint128 remainingPlain = auction.totalSupplyPlain - auction.soldAmountPlain;
+        if (fillResult > remainingPlain) revert AuctionTransferFailed();
+
+        _verifyAndPublishDecryptResult(pending.encFinalPayment, paymentResult, paymentSignature);
+        _verifyAndPublishDecryptResult(pending.encFinalFill, fillResult, fillSignature);
+
+        FHE.allow(pending.encFinalPayment, pool.paymentToken);
+        FHE.allow(pending.encFinalFill, pool.auctionToken);
+
+        if (!_transferFromEncrypted(pool.paymentToken, msg.sender, auction.seller, pending.encFinalPayment)) {
             revert PaymentTransferFailed();
         }
-        if (!_transferFromEncrypted(pool.auctionToken, auction.seller, sender, encFinalFill)) {
+        if (!_transferFromEncrypted(pool.auctionToken, auction.seller, msg.sender, pending.encFinalFill)) {
             revert AuctionTransferFailed();
         }
 
-        auction.soldAmount = FHE.add(auction.soldAmount, encFinalFill);
+        auction.soldAmount = FHE.add(auction.soldAmount, pending.encFinalFill);
         FHE.allowThis(auction.soldAmount);
+        auction.soldAmountPlain += fillResult;
 
-        emit AuctionPurchase(poolId, pending.auctionId, sender, uint64(block.timestamp));
+        paymentTokensSpent = paymentResult;
+        auctionTokensFilled = fillResult;
 
-        return (IHooks.afterSwap.selector, 0);
+        delete pendingPurchases[msg.sender][poolId];
+
+        if (auction.soldAmountPlain >= auction.totalSupplyPlain) {
+            uint256 soldOutAuctionId = pool.activeAuctionId;
+            _deactivateAuction(pool, auction);
+            emit AuctionSoldOut(pool.poolId, soldOutAuctionId);
+        }
+
+        emit AuctionPurchase(poolId, pendingAuctionId, msg.sender, uint64(block.timestamp));
+    }
+
+    function cancelPendingPurchase(PoolId poolId) external {
+        PendingPurchase storage pending = pendingPurchases[msg.sender][poolId];
+        if (pending.auctionId == 0) revert PendingPurchaseNotReady();
+        delete pendingPurchases[msg.sender][poolId];
     }
 
     function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
@@ -442,6 +570,21 @@ contract StealthDutchAuctionHook is IHooks {
         }
 
         return true;
+    }
+
+    function _verifyAndPublishDecryptResult(euint128 encryptedValue, uint128 plaintextValue, bytes calldata signature)
+        internal
+    {
+        uint256 handle = uint256(euint128.unwrap(encryptedValue));
+        if (handle == 0) revert InvalidDecryptProof();
+        if (!ITaskManager(TASK_MANAGER_ADDRESS).verifyDecryptResultSafe(handle, plaintextValue, signature)) {
+            revert InvalidDecryptProof();
+        }
+        ITaskManager(TASK_MANAGER_ADDRESS).publishDecryptResult(handle, plaintextValue, signature);
+    }
+
+    function _finalizeDeadline() internal view returns (uint64) {
+        return uint64(block.timestamp + FINALIZE_WINDOW);
     }
 
     function _deactivateAuction(AuctionPool storage pool, DutchAuction storage auction) internal {

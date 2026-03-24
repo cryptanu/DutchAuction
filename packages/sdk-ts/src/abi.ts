@@ -73,6 +73,45 @@ export const stealthDutchAuctionHookAbi = [
       }
     ],
     outputs: [{ name: "paymentTokensSpent", type: "uint128" }]
+  },
+  {
+    type: "function",
+    stateMutability: "view",
+    name: "getPendingPurchase",
+    inputs: [
+      { name: "buyer", type: "address" },
+      { name: "poolId", type: "bytes32" }
+    ],
+    outputs: [
+      { name: "auctionId", type: "uint256" },
+      { name: "encAuctionTokens", type: "bytes32" },
+      { name: "maxPricePerToken", type: "uint128" },
+      { name: "minPaymentTokensFromSwap", type: "uint128" },
+      { name: "priceAtIntent", type: "uint128" },
+      { name: "paymentOut", type: "uint128" },
+      { name: "maxAffordableTokens", type: "uint128" },
+      { name: "encFinalFill", type: "bytes32" },
+      { name: "encFinalPayment", type: "bytes32" },
+      { name: "finalizeDeadline", type: "uint64" },
+      { name: "ready", type: "bool" },
+      { name: "direct", type: "bool" }
+    ]
+  },
+  {
+    type: "function",
+    stateMutability: "nonpayable",
+    name: "finalizePendingPurchase",
+    inputs: [
+      { name: "poolId", type: "bytes32" },
+      { name: "paymentResult", type: "uint128" },
+      { name: "paymentSignature", type: "bytes" },
+      { name: "fillResult", type: "uint128" },
+      { name: "fillSignature", type: "bytes" }
+    ],
+    outputs: [
+      { name: "paymentTokensSpent", type: "uint128" },
+      { name: "auctionTokensFilled", type: "uint128" }
+    ]
   }
 ] as const;
 

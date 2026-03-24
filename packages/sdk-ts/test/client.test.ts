@@ -72,6 +72,22 @@ const createMockConfig = (): AuctionClientConfig & { writes: ContractWriteReques
           true,
         ] as const;
       }
+      if (input.functionName === "getPendingPurchase") {
+        return [
+          1n,
+          ("0x" + "08".repeat(32)) as Hex,
+          100n,
+          0n,
+          63n,
+          2000n,
+          31n,
+          ("0x" + "09".repeat(32)) as Hex,
+          ("0x" + "0a".repeat(32)) as Hex,
+          1_800_000_000n,
+          true,
+          false,
+        ] as const;
+      }
       throw new Error(`Unexpected read function: ${input.functionName}`);
     },
   };
@@ -221,6 +237,25 @@ test("buyWithPaymentTokenEncrypted submits encrypted direct buy tx", async () =>
   assert.match(txHash, /^0x[0-9a-f]+$/i);
   assert.equal(config.writes.length, 1);
   assert.equal(config.writes[0]?.functionName, "buyWithPaymentTokenEncrypted");
+});
+
+test("finalizePendingPurchase submits finalize tx", async () => {
+  const config = createMockConfig();
+  const client = createAuctionClient(config);
+
+  const pending = await client.auction.getPendingPurchase({ poolId: POOL_ID });
+  assert.equal(pending.ready, true);
+  assert.equal(pending.auctionId, 1n);
+
+  const txHash = await client.auction.finalizePendingPurchase({
+    poolId: POOL_ID,
+    paymentProof: { value: 1000n, signature: "0x12" },
+    fillProof: { value: 10n, signature: "0x34" },
+  });
+
+  assert.match(txHash, /^0x[0-9a-f]+$/i);
+  assert.equal(config.writes.length, 1);
+  assert.equal(config.writes[0]?.functionName, "finalizePendingPurchase");
 });
 
 test("buyWithPaymentTokenEncrypted rejects placeholder proof tuples", async () => {
