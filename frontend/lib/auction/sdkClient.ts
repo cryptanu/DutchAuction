@@ -29,6 +29,7 @@ type WriteContractAsync = (input: {
 type FrontendAuctionClientInput = {
   publicClient: FrontendPublicClient;
   writeContractAsync?: WriteContractAsync;
+  accountAddress?: Address;
   addresses: AuctionClientConfig["addresses"];
   pool: AuctionClientConfig["pool"];
   cofhe?: CofheAdapter;
@@ -38,6 +39,7 @@ export const createFrontendAuctionClient = (input: FrontendAuctionClientInput): 
   const writeContractAsync = input.writeContractAsync;
   const walletClient = writeContractAsync
     ? {
+        account: input.accountAddress ? { address: input.accountAddress as Hex } : undefined,
         writeContract: async (request: {
           address: Address;
           abi: readonly unknown[];

@@ -324,6 +324,7 @@ const Home = () => {
         readContract: publicClient.readContract,
       },
       writeContractAsync,
+      accountAddress: connectedAddress,
       addresses: {
         hookAddress: auctionConfig.hookAddress! as Hex,
         poolManagerAddress: auctionConfig.poolManagerAddress! as Hex,
@@ -341,7 +342,7 @@ const Home = () => {
           }
         : undefined,
     });
-  }, [publicClient, writeContractAsync]);
+  }, [publicClient, writeContractAsync, connectedAddress]);
 
   const poolKey = useMemo<PoolKey | undefined>(() => {
     if (!isAuctionConfigReady) return undefined;
