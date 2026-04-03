@@ -15,8 +15,27 @@ const ADDRESSES = {
 
 const POOL_ID = ("0x" + "ab".repeat(32)) as Hex;
 
-const createMockConfig = (): AuctionClientConfig & { writes: ContractWriteRequest[] } => {
+const createMockConfig = (overrides?: {
+  pendingPurchase?: readonly [bigint, Hex, bigint, bigint, bigint, bigint, bigint, Hex, Hex, bigint, boolean, boolean];
+  account?: Hex | null;
+}): AuctionClientConfig & { writes: ContractWriteRequest[] } => {
   const writes: ContractWriteRequest[] = [];
+  const pendingPurchase =
+    overrides?.pendingPurchase ??
+    ([
+      1n,
+      ("0x" + "08".repeat(32)) as Hex,
+      100n,
+      0n,
+      63n,
+      2000n,
+      31n,
+      ("0x" + "09".repeat(32)) as Hex,
+      ("0x" + "0a".repeat(32)) as Hex,
+      1_800_000_000n,
+      true,
+      false,
+    ] as const);
 
   const publicClient = {
     chain: { id: 84532 },
@@ -73,20 +92,7 @@ const createMockConfig = (): AuctionClientConfig & { writes: ContractWriteReques
         ] as const;
       }
       if (input.functionName === "getPendingPurchase") {
-        return [
-          1n,
-          ("0x" + "08".repeat(32)) as Hex,
-          100n,
-          0n,
-          63n,
-          2000n,
-          31n,
-          ("0x" + "09".repeat(32)) as Hex,
-          ("0x" + "0a".repeat(32)) as Hex,
-          1_800_000_000n,
-          true,
-          false,
-        ] as const;
+        return pendingPurchase;
       }
       throw new Error(`Unexpected read function: ${input.functionName}`);
     },
@@ -94,7 +100,10 @@ const createMockConfig = (): AuctionClientConfig & { writes: ContractWriteReques
 
   const walletClient = {
     chain: { id: 84532 },
-    account: { address: "0x7777777777777777777777777777777777777777" as const },
+    account:
+      overrides?.account === null
+        ? undefined
+        : { address: (overrides?.account ?? "0x7777777777777777777777777777777777777777") as Hex },
     writeContract: async (input: ContractWriteRequest) => {
       writes.push(input);
       return ("0x" + "12".repeat(32)) as Hex;
@@ -256,6 +265,125 @@ test("finalizePendingPurchase submits finalize tx", async () => {
   assert.match(txHash, /^0x[0-9a-f]+$/i);
   assert.equal(config.writes.length, 1);
   assert.equal(config.writes[0]?.functionName, "finalizePendingPurchase");
+});
+
+test("finalizePendingPurchaseFor submits delegated finalize tx", async () => {
+  const config = createMockConfig();
+  const client = createAuctionClient(config);
+
+  const txHash = await client.auction.finalizePendingPurchaseFor({
+    buyer: "0x8888888888888888888888888888888888888888",
+    poolId: POOL_ID,
+    paymentProof: { value: 1000n, signature: "0x12" },
+    fillProof: { value: 10n, signature: "0x34" },
+  });
+
+  assert.match(txHash, /^0x[0-9a-f]+$/i);
+  assert.equal(config.writes.length, 1);
+  assert.equal(config.writes[0]?.functionName, "finalizePendingPurchaseFor");
+});
+
+test("getPendingPurchase fails without buyer/account context", async () => {
+  const config = createMockConfig({ account: null });
+  const client = createAuctionClient(config);
+
+  await assert.rejects(
+    () => client.auction.getPendingPurchase({ poolId: POOL_ID }),
+    (error: unknown) => {
+      assert.ok(error instanceof AuctionClientError);
+      assert.equal((error as AuctionClientError).code, "WALLET_UNAVAILABLE");
+      return true;
+    },
+  );
+});
+
+test("finalizePendingPurchase rejects malformed proof signature", async () => {
+  const config = createMockConfig();
+  const client = createAuctionClient(config);
+
+  await assert.rejects(
+    () =>
+      client.auction.finalizePendingPurchase({
+        poolId: POOL_ID,
+        paymentProof: { value: 1000n, signature: "nothex" as Hex },
+        fillProof: { value: 10n, signature: "0x34" },
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof AuctionClientError);
+      assert.equal((error as AuctionClientError).code, "PROOF_INVALID");
+      return true;
+    },
+  );
+});
+
+test("finalizePendingPurchase rejects when pending is not ready", async () => {
+  const config = createMockConfig({
+    pendingPurchase: [
+      1n,
+      ("0x" + "08".repeat(32)) as Hex,
+      100n,
+      0n,
+      63n,
+      2000n,
+      31n,
+      ("0x" + "09".repeat(32)) as Hex,
+      ("0x" + "0a".repeat(32)) as Hex,
+      1_800_000_000n,
+      false,
+      false,
+    ],
+  });
+  const client = createAuctionClient(config);
+
+  await assert.rejects(
+    () =>
+      client.auction.finalizePendingPurchase({
+        poolId: POOL_ID,
+        paymentProof: { value: 1000n, signature: "0x12" },
+        fillProof: { value: 10n, signature: "0x34" },
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof AuctionClientError);
+      assert.equal((error as AuctionClientError).code, "PENDING_NOT_READY");
+      return true;
+    },
+  );
+});
+
+test("finalizePendingPurchaseFor rejects when pending deadline expired", async () => {
+  const expiredDeadline = BigInt(Math.floor(Date.now() / 1000)) - 5n;
+  const config = createMockConfig({
+    pendingPurchase: [
+      1n,
+      ("0x" + "08".repeat(32)) as Hex,
+      100n,
+      0n,
+      63n,
+      2000n,
+      31n,
+      ("0x" + "09".repeat(32)) as Hex,
+      ("0x" + "0a".repeat(32)) as Hex,
+      expiredDeadline,
+      true,
+      false,
+    ],
+  });
+  const client = createAuctionClient(config);
+
+  await assert.rejects(
+    () =>
+      client.auction.finalizePendingPurchaseFor({
+        buyer: "0x8888888888888888888888888888888888888888",
+        poolId: POOL_ID,
+        paymentProof: { value: 1000n, signature: "0x12" },
+        fillProof: { value: 10n, signature: "0x34" },
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof AuctionClientError);
+      assert.equal((error as AuctionClientError).code, "PENDING_EXPIRED");
+      return true;
+    },
+  );
 });
 
 test("buyWithPaymentTokenEncrypted rejects placeholder proof tuples", async () => {

@@ -62,6 +62,9 @@ Current close/progress behavior:
   - supports encrypted modes `proofs` and `sdk` only.
 - `client.auction.swapAndBuy(...)`
   - preflight guard + tx submission.
+- `client.auction.getPendingPurchase(...)`
+- `client.auction.finalizePendingPurchase(...)`
+- `client.auction.finalizePendingPurchaseFor(...)`
 - `client.auction.buyWithPaymentTokenEncrypted(...)`
 - `client.decrypt.forView(...)`
 - `client.decrypt.forTx(...)`
@@ -94,6 +97,7 @@ node --test packages/sdk-ts/dist/test/**/*.test.js
 cd frontend
 yarn install
 yarn dev
+yarn probe:two-step
 ```
 
 ## Required Frontend Env
@@ -110,6 +114,19 @@ NEXT_PUBLIC_POOL_FEE=3000
 NEXT_PUBLIC_POOL_TICK_SPACING=60
 NEXT_PUBLIC_DEFAULT_SELLER_ADDRESS=
 NEXT_PUBLIC_BASE_SEPOLIA_RPC_URL=https://sepolia.base.org
+NEXT_PUBLIC_RELAYER_ENABLED=false
+NEXT_PUBLIC_RELAYER_ENDPOINT=/api/relayer/finalize-pending
+```
+
+### Relayer Env (deferred for v1)
+
+Manual two-step finalize is the ship path for this milestone. Relayer one-click finalize is deferred.
+If you test relayer mode locally, set these server-side vars in `frontend/.env.local`:
+
+```bash
+RELAYER_PRIVATE_KEY=
+RELAYER_RPC_URL=https://sepolia.base.org
+RELAYER_HOOK_ADDRESS=
 ```
 
 ## Docs
@@ -136,6 +153,15 @@ NEXT_PUBLIC_BASE_SEPOLIA_RPC_URL=https://sepolia.base.org
 - Fix in progress (as of 2026-03-23): `transferFromEncrypted` now avoids hard failure when decrypt result is not ready
   by using `getDecryptResultSafe(...)`, but settlement still computes with decrypted amount when available (allowance
   update + `_transfer`), which is a privacy leak surface. See `docs/transferFromEncrypted-fix-in-progress.md`.
-- Known issue (as of 2026-03-23): swap + hook settlement on Base Sepolia can still revert during gas estimation with
-  `exceeds max transaction gas limit` even after sender-context and ACL hardening patches. Direct encrypted buy and
-  local/unit/e2e tests pass; on-chain swap investigation remains open.
+- Latest live probe (Base Sepolia, 2026-04-03): manual two-step settlement is executing below gas cap with stable
+  measured usage:
+  - Step 1 swap + register intent: ~`592,770` to `592,782` gas.
+  - Step 2 finalize pending purchase: ~`367,488` gas.
+  - Combined path: ~`960k` gas, well below Base Sepolia per-tx cap (`25,000,000`).
+- Added deterministic signed probe command: `cd frontend && yarn probe:two-step`.
+  The probe now includes:
+  - pending-read retry window after step 1 (handles RPC read-after-write lag),
+  - decrypt-for-tx retry/backoff for transient threshold-service responses (`403/404/428`),
+  - pending-clear verification after step 2.
+- v1 release scope (testnet): manual two-step flow is primary (`Step 1 submit`, `Step 2 finalize pending`); relayer
+  one-click flow is out-of-scope for production guarantees in this release.

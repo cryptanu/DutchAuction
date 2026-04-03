@@ -20,6 +20,7 @@ contract StealthDutchAuctionHookTest is Test {
 
     address internal seller = makeAddr("seller");
     address internal buyer = makeAddr("buyer");
+    address internal relayer = makeAddr("relayer");
 
     MockFHERC20 internal weth;
     MockFHERC20 internal paymentToken;
@@ -204,6 +205,28 @@ contract StealthDutchAuctionHookTest is Test {
         vm.prank(buyer);
         vm.expectRevert(StealthDutchAuctionHook.InvalidDecryptProof.selector);
         hook.finalizePendingPurchase(poolId, 999, bytes(""), 10, bytes(""));
+    }
+
+    function test_finalizePendingPurchaseFor_allowsRelayerSponsoredFinalize() public {
+        bytes memory hookData = _buildEncryptedSwapIntent(10, 110, 1_900);
+
+        vm.prank(buyer);
+        poolManager.swap(
+            poolKey,
+            SwapParams({zeroForOne: true, amountSpecified: -int256(uint256(2)), sqrtPriceLimitX96: 0}),
+            hookData
+        );
+
+        vm.prank(relayer);
+        hook.finalizePendingPurchaseFor(buyer, poolId, 1_000, bytes(""), 10, bytes(""));
+
+        assertEq(paymentToken.balanceOf(buyer), 1_000);
+        assertEq(paymentToken.balanceOf(seller), 1_000);
+        assertEq(auctionToken.balanceOf(buyer), 10);
+        assertEq(auctionToken.balanceOf(seller), 990);
+
+        StealthDutchAuctionHook.PendingPurchase memory pending = hook.getPendingPurchase(buyer, poolId);
+        assertEq(pending.auctionId, 0);
     }
 
     function test_supplyCap_marksAuctionSoldOut_afterFinalize() public {
