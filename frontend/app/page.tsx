@@ -20,14 +20,18 @@ import {
   mockPoolManagerAbi,
   stealthDutchAuctionHookAbi,
 } from "~~/lib/auction/abis";
-import { auctionConfig, isAuctionConfigReady, requiredEnvKeys } from "~~/lib/auction/config";
+import { auctionConfig, isAuctionConfigReady, relayerConfig, requiredEnvKeys } from "~~/lib/auction/config";
 import {
   getCofheHookDataBuilder,
   installCofheInjectionHelpersOnWindow,
   tryAutoInjectCofheHookDataBuilderFromWindow,
 } from "~~/lib/auction/cofheAdapter";
 import { createFrontendAuctionClient } from "~~/lib/auction/sdkClient";
-import { deriveIntentProofsViaCofheSdk, initializeCofheSdkBuilder } from "~~/lib/auction/cofheSdkBootstrap";
+import {
+  decryptHandleForTxViaCofheSdk,
+  deriveIntentProofsViaCofheSdk,
+  initializeCofheSdkBuilder,
+} from "~~/lib/auction/cofheSdkBootstrap";
 import {
   InEProof,
   PoolKey,
@@ -43,6 +47,8 @@ const EVENT_LOOKBACK_BLOCKS = 80_000n;
 const MAX_LOG_QUERY_RANGE = 9_999n;
 const DEFAULT_PROOF_JSON = '{"ctHash":"0","securityZone":0,"utype":6,"signature":"0x"}';
 const TASK_MANAGER_ADDRESS = "0xeA30c4B8b44078Bbf8a6ef5b9f1eC1626C7848D9" as Address;
+const ZERO_HANDLE = ("0x" + "0".repeat(64)) as Hex;
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const taskManagerVerifyInputAbi = [
   {
@@ -69,6 +75,20 @@ const taskManagerVerifyInputAbi = [
 type PoolAuctionTuple = readonly [Hex, Address, Address, bigint];
 type AuctionPlainStateTuple = readonly [Address, boolean, bigint, bigint, bigint, bigint, bigint, bigint, bigint];
 type PoolConfigTuple = readonly [PoolKey, bigint, bigint, boolean];
+type PendingPurchaseTuple = {
+  auctionId: bigint;
+  encAuctionTokens: Hex;
+  maxPricePerToken: bigint;
+  minPaymentTokensFromSwap: bigint;
+  priceAtIntent: bigint;
+  paymentOut: bigint;
+  maxAffordableTokens: bigint;
+  encFinalFill: Hex;
+  encFinalPayment: Hex;
+  finalizeDeadline: bigint;
+  ready: boolean;
+  direct: boolean;
+};
 type SdkHealthcheck = Awaited<ReturnType<ReturnType<typeof createFrontendAuctionClient>["healthcheck"]>>;
 
 type ActivityItem = {
@@ -77,6 +97,19 @@ type ActivityItem = {
   detail: string;
   blockNumber: bigint;
   txHash: Hex;
+};
+
+type PendingFromEvent = {
+  auctionId: bigint;
+  paymentHandle: Hex;
+  fillHandle: Hex;
+  finalizeDeadline: bigint;
+  direct: boolean;
+};
+
+const isSameAddress = (lhs?: Address, rhs?: Address): boolean => {
+  if (!lhs || !rhs) return false;
+  return lhs.toLowerCase() === rhs.toLowerCase();
 };
 
 const parseProofJson = (value: string, label: string): InEProof => {
@@ -132,9 +165,33 @@ const shortHash = (hash: Hex | undefined): string => {
   return `${hash.slice(0, 10)}...${hash.slice(-8)}`;
 };
 
+const KNOWN_ERROR_SIGNATURES: Record<string, string> = {
+  "0x730d2e2a": "Pending purchase already exists for this wallet. Finalize or cancel it first.",
+  "0x62541316": "No pending purchase is ready to finalize yet.",
+  "0xf537189c": "Pending purchase finalize window expired. Submit a new intent.",
+  "0x69b8d0fe": "Auction is not active.",
+  "0x13be252b": "Insufficient allowance. Re-run approvals for this deployment.",
+  "0x2ee66eed": "Encrypted payment transfer failed.",
+  "0x285780d9": "Encrypted auction transfer failed.",
+  "0xc907e654": "Decrypt proof verification failed.",
+};
+
 const parseError = (err: unknown): string => {
   if (err instanceof Error && err.message) {
     const maybeCode = (err as Error & { code?: string }).code;
+    const signatureMatch = err.message.match(/0x[0-9a-fA-F]{8}/);
+    if (signatureMatch) {
+      const signature = signatureMatch[0].toLowerCase();
+      const mapped = KNOWN_ERROR_SIGNATURES[signature];
+      if (mapped) {
+        return mapped;
+      }
+    }
+
+    if (/exceeds max(imum)? per-transaction gas limit|exceeds max transaction gas limit/i.test(err.message)) {
+      return "RPC gas cap exceeded during estimation. This usually means invalid inputs for the current state (or stale pending state), not necessarily high runtime gas.";
+    }
+
     return maybeCode ? `[${maybeCode}] ${err.message}` : err.message;
   }
   return "Transaction failed.";
@@ -173,6 +230,16 @@ const toActivity = (
         id: `${txHash}-${logIndex.toString()}`,
         title: "Auction purchase settled",
         detail: `${shortAddress(args.buyer)} settled on auction #${args.auctionId.toString()} at t=${args.timestamp.toString()}`,
+        blockNumber,
+        txHash,
+      };
+    }
+    case "AuctionSettlementReady": {
+      const args = decoded.args as { auctionId: bigint; buyer: Address; finalizeDeadline: bigint; direct: boolean };
+      return {
+        id: `${txHash}-${logIndex.toString()}`,
+        title: "Settlement pending finalize",
+        detail: `${shortAddress(args.buyer)} pending #${args.auctionId.toString()} (${args.direct ? "direct" : "swap"}) until ${args.finalizeDeadline.toString()}`,
         blockNumber,
         txHash,
       };
@@ -240,6 +307,9 @@ const Home = () => {
   const [sdkHealthError, setSdkHealthError] = useState<string | undefined>();
   const [cofheInitError, setCofheInitError] = useState<string | undefined>();
   const [cofheBuilderReady, setCofheBuilderReady] = useState<boolean>(Boolean(getCofheHookDataBuilder()));
+  const [pendingFromEvent, setPendingFromEvent] = useState<PendingFromEvent | undefined>();
+  const useRelayerFinalize = false;
+  const [relayerBusy, setRelayerBusy] = useState(false);
 
   const createSdkClient = useCallback(() => {
     if (!publicClient || !isAuctionConfigReady) return undefined;
@@ -254,6 +324,7 @@ const Home = () => {
         readContract: publicClient.readContract,
       },
       writeContractAsync,
+      accountAddress: connectedAddress,
       addresses: {
         hookAddress: auctionConfig.hookAddress! as Hex,
         poolManagerAddress: auctionConfig.poolManagerAddress! as Hex,
@@ -271,7 +342,7 @@ const Home = () => {
           }
         : undefined,
     });
-  }, [publicClient, writeContractAsync]);
+  }, [publicClient, writeContractAsync, connectedAddress]);
 
   const poolKey = useMemo<PoolKey | undefined>(() => {
     if (!isAuctionConfigReady) return undefined;
@@ -286,9 +357,10 @@ const Home = () => {
   }, []);
 
   const poolId = useMemo<Hex | undefined>(() => {
+    if (auctionConfig.poolIdOverride) return auctionConfig.poolIdOverride;
     if (!poolKey) return undefined;
     return poolKeyToId(poolKey);
-  }, [poolKey]);
+  }, [poolKey, auctionConfig.poolIdOverride]);
 
   const { data: poolAuctionRaw, refetch: refetchPoolAuction } = useReadContract({
     chainId: baseSepolia.id,
@@ -438,12 +510,49 @@ const Home = () => {
     },
   });
 
+  const { data: pendingPurchaseRaw, error: pendingPurchaseError, refetch: refetchPendingPurchase } = useReadContract({
+    chainId: baseSepolia.id,
+    address: auctionConfig.hookAddress,
+    abi: stealthDutchAuctionHookAbi,
+    functionName: "getPendingPurchase",
+    args: connectedAddress && poolId ? [connectedAddress, poolId] : undefined,
+    query: {
+      enabled: Boolean(connectedAddress && poolId && auctionConfig.hookAddress),
+      refetchInterval: 4000,
+    },
+  });
+
   const token0Balance = (token0BalanceRaw as bigint | undefined) ?? 0n;
   const paymentBalance = (paymentBalanceRaw as bigint | undefined) ?? 0n;
   const auctionBalance = (auctionBalanceRaw as bigint | undefined) ?? 0n;
   const token0AllowancePool = (token0AllowancePoolRaw as bigint | undefined) ?? 0n;
   const paymentAllowanceHook = (paymentAllowanceHookRaw as bigint | undefined) ?? 0n;
   const auctionAllowanceHook = (auctionAllowanceHookRaw as bigint | undefined) ?? 0n;
+  const pendingPurchase = pendingPurchaseRaw as PendingPurchaseTuple | undefined;
+  const pendingAuctionId = pendingPurchase?.auctionId ?? 0n;
+  const pendingFillHandle = pendingPurchase?.encFinalFill ?? ZERO_HANDLE;
+  const pendingPaymentHandle = pendingPurchase?.encFinalPayment ?? ZERO_HANDLE;
+  const pendingFinalizeDeadline = pendingPurchase?.finalizeDeadline ?? 0n;
+  const pendingReady = pendingPurchase?.ready ?? false;
+  const pendingReadErrorText = pendingPurchaseError ? parseError(pendingPurchaseError) : undefined;
+  const pendingFeatureUnsupported = Boolean(
+    pendingReadErrorText &&
+      /function|selector|revert|unknown|not found|does not exist/i.test(pendingReadErrorText.toLowerCase()),
+  );
+  const activePendingFromEvent =
+    pendingFromEvent && pendingFromEvent.finalizeDeadline > nowSec ? pendingFromEvent : undefined;
+
+  const contractPendingReady =
+    pendingReady && pendingAuctionId > 0n && pendingPaymentHandle !== ZERO_HANDLE && pendingFillHandle !== ZERO_HANDLE;
+  const effectivePendingAuctionId = contractPendingReady ? pendingAuctionId : (activePendingFromEvent?.auctionId ?? 0n);
+  const effectivePendingFillHandle =
+    contractPendingReady ? pendingFillHandle : (activePendingFromEvent?.fillHandle ?? ZERO_HANDLE);
+  const effectivePendingPaymentHandle =
+    contractPendingReady ? pendingPaymentHandle : (activePendingFromEvent?.paymentHandle ?? ZERO_HANDLE);
+  const effectivePendingFinalizeDeadline =
+    contractPendingReady ? pendingFinalizeDeadline : (activePendingFromEvent?.finalizeDeadline ?? 0n);
+  const effectivePendingReady = contractPendingReady || Boolean(activePendingFromEvent);
+  const effectivePendingSource = contractPendingReady ? "contract" : activePendingFromEvent ? "event" : "-";
 
   const { isLoading: txIsConfirming, isSuccess: txConfirmed, isError: txFailed, error: txError } =
     useWaitForTransactionReceipt({
@@ -455,6 +564,7 @@ const Home = () => {
   const refreshActivity = useCallback(async () => {
     if (!publicClient || !auctionConfig.hookAddress) {
       setActivity([]);
+      setPendingFromEvent(undefined);
       return;
     }
 
@@ -477,32 +587,121 @@ const Home = () => {
         chunkFrom = chunkTo + 1n;
       }
 
-      const parsed = logs
-        .map(log => {
-          try {
-            if (!log.transactionHash) return undefined;
-            const decoded = decodeEventLog({
-              abi: stealthDutchAuctionHookAbi,
-              data: log.data,
-              topics: log.topics,
-            });
+      const decodedLogs: Array<{
+        decoded: { eventName: string; args: unknown };
+        txHash: Hex;
+        blockNumber: bigint;
+        logIndex: bigint;
+      }> = [];
+      for (const log of logs) {
+        try {
+          if (!log.transactionHash) continue;
+          const decoded = decodeEventLog({
+            abi: stealthDutchAuctionHookAbi,
+            data: log.data,
+            topics: log.topics,
+          }) as { eventName: string; args: unknown };
+          decodedLogs.push({
+            decoded,
+            txHash: log.transactionHash,
+            blockNumber: log.blockNumber ?? 0n,
+            logIndex: BigInt(log.logIndex ?? 0),
+          });
+        } catch {
+          continue;
+        }
+      }
 
-            return toActivity(decoded, log.transactionHash, log.blockNumber ?? 0n, BigInt(log.logIndex ?? 0));
-          } catch {
-            return undefined;
-          }
-        })
-        .filter((item): item is ActivityItem => item !== undefined)
+      const parsed = decodedLogs
+        .map(item => toActivity(item.decoded, item.txHash, item.blockNumber, item.logIndex))
         .sort((a, b) => {
           if (a.blockNumber === b.blockNumber) return a.id < b.id ? 1 : -1;
           return a.blockNumber < b.blockNumber ? 1 : -1;
         });
 
       setActivity(parsed.slice(0, 25));
+
+      if (!connectedAddress) {
+        setPendingFromEvent(undefined);
+      } else {
+        const pendingByAuction = new Map<
+          string,
+          PendingFromEvent & {
+            blockNumber: bigint;
+            logIndex: bigint;
+          }
+        >();
+        const asc = [...decodedLogs].sort((a, b) => {
+          if (a.blockNumber === b.blockNumber) return a.logIndex < b.logIndex ? -1 : 1;
+          return a.blockNumber < b.blockNumber ? -1 : 1;
+        });
+
+        for (const item of asc) {
+          if (item.decoded.eventName === "AuctionSettlementReady") {
+            const args = item.decoded.args as {
+              auctionId: bigint;
+              buyer: Address;
+              paymentHandle: bigint;
+              fillHandle: bigint;
+              finalizeDeadline: bigint;
+              direct: boolean;
+            };
+            if (!isSameAddress(args.buyer, connectedAddress)) continue;
+            pendingByAuction.set(args.auctionId.toString(), {
+              auctionId: args.auctionId,
+              paymentHandle: (`0x${args.paymentHandle.toString(16).padStart(64, "0")}`) as Hex,
+              fillHandle: (`0x${args.fillHandle.toString(16).padStart(64, "0")}`) as Hex,
+              finalizeDeadline: args.finalizeDeadline,
+              direct: args.direct,
+              blockNumber: item.blockNumber,
+              logIndex: item.logIndex,
+            });
+            continue;
+          }
+
+          if (item.decoded.eventName === "AuctionPurchase") {
+            const args = item.decoded.args as { auctionId: bigint; buyer: Address };
+            if (!isSameAddress(args.buyer, connectedAddress)) continue;
+            pendingByAuction.delete(args.auctionId.toString());
+          }
+        }
+
+        let latestPending:
+          | (PendingFromEvent & {
+              blockNumber: bigint;
+              logIndex: bigint;
+            })
+          | undefined;
+        for (const candidate of pendingByAuction.values()) {
+          if (!latestPending) {
+            latestPending = candidate;
+            continue;
+          }
+          if (candidate.blockNumber > latestPending.blockNumber) {
+            latestPending = candidate;
+            continue;
+          }
+          if (candidate.blockNumber === latestPending.blockNumber && candidate.logIndex > latestPending.logIndex) {
+            latestPending = candidate;
+          }
+        }
+
+        if (!latestPending) {
+          setPendingFromEvent(undefined);
+        } else {
+          setPendingFromEvent({
+            auctionId: latestPending.auctionId,
+            paymentHandle: latestPending.paymentHandle,
+            fillHandle: latestPending.fillHandle,
+            finalizeDeadline: latestPending.finalizeDeadline,
+            direct: latestPending.direct,
+          });
+        }
+      }
     } catch (err) {
       toast.error(parseError(err));
     }
-  }, [publicClient, auctionConfig.hookAddress, blockNumber]);
+  }, [publicClient, auctionConfig.hookAddress, blockNumber, connectedAddress]);
 
   const refreshContractReads = useCallback(async () => {
     await Promise.all([
@@ -516,6 +715,7 @@ const Home = () => {
       refetchToken0Allowance(),
       refetchPaymentAllowance(),
       refetchAuctionAllowance(),
+      refetchPendingPurchase(),
     ]);
   }, [
     refetchPoolAuction,
@@ -528,7 +728,14 @@ const Home = () => {
     refetchToken0Allowance,
     refetchPaymentAllowance,
     refetchAuctionAllowance,
+    refetchPendingPurchase,
   ]);
+
+  const refreshContractReadsBurst = useCallback(() => {
+    void refreshContractReads();
+    setTimeout(() => void refreshContractReads(), 1500);
+    setTimeout(() => void refreshContractReads(), 5000);
+  }, [refreshContractReads]);
 
   const runWrite = useCallback(
     async (label: string, action: () => Promise<Hex>) => {
@@ -643,26 +850,29 @@ const Home = () => {
     abi: stealthDutchAuctionHookAbi,
     enabled: Boolean(auctionConfig.hookAddress),
     onLogs(logs) {
-      const incoming = logs
-        .map(log => {
-          try {
-            const decoded = decodeEventLog({
-              abi: stealthDutchAuctionHookAbi,
-              data: log.data,
-              topics: log.topics,
-            });
-            return toActivity(decoded, log.transactionHash, log.blockNumber ?? 0n, BigInt(log.logIndex ?? 0));
-          } catch {
-            return undefined;
-          }
-        })
-        .filter((item): item is ActivityItem => item !== undefined);
+      const incoming: Array<{ eventName: string; activity: ActivityItem }> = [];
+      for (const log of logs) {
+        try {
+          if (!log.transactionHash) continue;
+          const decoded = decodeEventLog({
+            abi: stealthDutchAuctionHookAbi,
+            data: log.data,
+            topics: log.topics,
+          });
+          incoming.push({
+            eventName: decoded.eventName,
+            activity: toActivity(decoded, log.transactionHash, log.blockNumber ?? 0n, BigInt(log.logIndex ?? 0)),
+          });
+        } catch {
+          continue;
+        }
+      }
 
       if (incoming.length === 0) return;
 
       setActivity(prev => {
         const map = new Map<string, ActivityItem>();
-        [...incoming, ...prev].forEach(item => map.set(item.id, item));
+        [...incoming.map(item => item.activity), ...prev].forEach(item => map.set(item.id, item));
         return [...map.values()]
           .sort((a, b) => {
             if (a.blockNumber === b.blockNumber) return a.id < b.id ? 1 : -1;
@@ -670,6 +880,17 @@ const Home = () => {
           })
           .slice(0, 25);
       });
+
+      void refreshActivity();
+      const shouldRefreshReads = incoming.some(
+        item =>
+          item.eventName === "AuctionPurchase" ||
+          item.eventName === "AuctionIntentRegistered" ||
+          item.eventName === "PoolAuctionInitialized",
+      );
+      if (shouldRefreshReads) {
+        refreshContractReadsBurst();
+      }
     },
   });
 
@@ -766,9 +987,9 @@ const Home = () => {
     toast.success(`${pendingTxLabel} confirmed`);
     setPendingTxHash(undefined);
     setPendingTxLabel("");
-    void refreshContractReads();
+    refreshContractReadsBurst();
     void refreshActivity();
-  }, [txConfirmed, pendingTxHash, pendingTxLabel, refreshContractReads, refreshActivity]);
+  }, [txConfirmed, pendingTxHash, pendingTxLabel, refreshContractReadsBurst, refreshActivity]);
 
   useEffect(() => {
     if (!txFailed || !pendingTxHash) return;
@@ -815,6 +1036,145 @@ const Home = () => {
       toast.error(parseError(err));
     }
   };
+
+  const relayFinalizePendingPurchase = useCallback(
+    async (input: {
+      buyer: Address;
+      poolId: Hex;
+      paymentProof: { value: bigint; signature: Hex };
+      fillProof: { value: bigint; signature: Hex };
+    }): Promise<Hex> => {
+      const response = await fetch(relayerConfig.endpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          buyer: input.buyer,
+          poolId: input.poolId,
+          paymentProof: {
+            value: input.paymentProof.value.toString(),
+            signature: input.paymentProof.signature,
+          },
+          fillProof: {
+            value: input.fillProof.value.toString(),
+            signature: input.fillProof.signature,
+          },
+        }),
+      });
+
+      const payload = (await response.json()) as { ok?: boolean; txHash?: Hex; error?: string };
+      if (!response.ok || !payload.ok || !payload.txHash || !isHex(payload.txHash)) {
+        throw new Error(payload.error || `Relayer request failed with status ${response.status}`);
+      }
+      return payload.txHash;
+    },
+    [],
+  );
+
+  const awaitPendingSettlement = useCallback(
+    async (buyer: Address, targetPoolId: Hex): Promise<PendingPurchaseTuple> => {
+      if (!publicClient || !auctionConfig.hookAddress) {
+        throw new Error("Public client is unavailable for pending settlement reads.");
+      }
+
+      for (let i = 0; i < 30; i += 1) {
+        const pending = (await publicClient.readContract({
+          address: auctionConfig.hookAddress,
+          abi: stealthDutchAuctionHookAbi,
+          functionName: "getPendingPurchase",
+          args: [buyer, targetPoolId],
+        })) as PendingPurchaseTuple;
+
+        const ready = pending.ready;
+        const fillHandle = pending.encFinalFill;
+        const paymentHandle = pending.encFinalPayment;
+        if (ready && fillHandle !== ZERO_HANDLE && paymentHandle !== ZERO_HANDLE) {
+          return pending;
+        }
+        await sleep(1500);
+      }
+
+      throw new Error("Pending settlement did not become ready in time.");
+    },
+    [publicClient],
+  );
+
+  const submitStep1WithOptionalRelayerFinalize = useCallback(
+    async (label: string, submit: () => Promise<Hex>) => {
+      if (!connectedAddress) {
+        toast.error("Connect a wallet first.");
+        return;
+      }
+
+      const step1Hash = await submit();
+      toast.success(`${label} submitted: ${shortHash(step1Hash)}`);
+
+      if (!useRelayerFinalize) {
+        setPendingTxLabel(label);
+        setPendingTxHash(step1Hash);
+        return;
+      }
+
+      if (!poolId || !publicClient || !walletClient) {
+        setPendingTxLabel(label);
+        setPendingTxHash(step1Hash);
+        toast.error("Relayer auto-finalize unavailable; Step 1 submitted only.");
+        return;
+      }
+
+      setRelayerBusy(true);
+
+      try {
+        await publicClient.waitForTransactionReceipt({
+          hash: step1Hash,
+          confirmations: 1,
+          timeout: 120_000,
+        });
+
+        await refreshContractReads();
+        await refreshActivity();
+
+        const pending = await awaitPendingSettlement(connectedAddress, poolId);
+        const fillHandle = pending.encFinalFill;
+        const paymentHandle = pending.encFinalPayment;
+
+        await initializeCofheSdkBuilder(publicClient, walletClient, { swapVerifierAccount: connectedAddress });
+        const paymentProof = await decryptHandleForTxViaCofheSdk(BigInt(paymentHandle), connectedAddress);
+        const fillProof = await decryptHandleForTxViaCofheSdk(BigInt(fillHandle), connectedAddress);
+
+        const relayHash = await relayFinalizePendingPurchase({
+          buyer: connectedAddress,
+          poolId,
+          paymentProof: {
+            value: paymentProof.decryptedValue,
+            signature: paymentProof.signature,
+          },
+          fillProof: {
+            value: fillProof.decryptedValue,
+            signature: fillProof.signature,
+          },
+        });
+
+        setPendingTxLabel("Relayer finalize pending purchase");
+        setPendingTxHash(relayHash);
+        toast.success(`Relayer finalize submitted: ${shortHash(relayHash)}`);
+      } finally {
+        setRelayerBusy(false);
+      }
+    },
+    [
+      awaitPendingSettlement,
+      connectedAddress,
+      poolId,
+      publicClient,
+      walletClient,
+      refreshContractReads,
+      refreshActivity,
+      relayFinalizePendingPurchase,
+      useRelayerFinalize,
+    ],
+  );
 
   const onSwapAndBuy = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -897,7 +1257,7 @@ const Home = () => {
         return;
       }
 
-      await runWrite("Swap + auction purchase", () =>
+      await submitStep1WithOptionalRelayerFinalize("Step 1: Swap + register intent", () =>
         sdkClient.auction.swapAndBuy({
           poolId,
           swapInput: amountIn,
@@ -948,13 +1308,71 @@ const Home = () => {
       }
       await verifyProofsForSender(proofs, connectedAddress);
 
-      await runWrite("Direct buy with payment token", () =>
+      await submitStep1WithOptionalRelayerFinalize("Step 1: Direct buy + register intent", () =>
         writeContractAsync({
           chainId: baseSepolia.id,
           address: auctionConfig.hookAddress!,
           abi: stealthDutchAuctionHookAbi,
           functionName: "buyWithPaymentTokenEncrypted",
           args: [poolId, proofs.desiredAuctionTokens, maxPricePerToken],
+        }),
+      );
+    } catch (err) {
+      toast.error(parseError(err));
+    }
+  };
+
+  const onFinalizePendingPurchase = async () => {
+    if (!connectedAddress) {
+      toast.error("Connect a wallet first.");
+      return;
+    }
+    if (!poolId) {
+      toast.error("Pool is not configured.");
+      return;
+    }
+    if (pendingFeatureUnsupported) {
+      toast.error(
+        "Current hook deployment does not expose pending-settlement reads. Redeploy latest 2-step hook and update frontend env.",
+      );
+      return;
+    }
+    if (!effectivePendingReady || effectivePendingAuctionId === 0n) {
+      toast.error("No ready pending purchase for this wallet.");
+      return;
+    }
+    if (effectivePendingPaymentHandle === ZERO_HANDLE || effectivePendingFillHandle === ZERO_HANDLE) {
+      toast.error("Pending settlement handles are missing.");
+      return;
+    }
+    if (!publicClient || !walletClient) {
+      toast.error("Wallet client unavailable.");
+      return;
+    }
+
+    try {
+      await initializeCofheSdkBuilder(publicClient, walletClient, { swapVerifierAccount: connectedAddress });
+
+      const paymentProof = await decryptHandleForTxViaCofheSdk(BigInt(effectivePendingPaymentHandle), connectedAddress);
+      const fillProof = await decryptHandleForTxViaCofheSdk(BigInt(effectivePendingFillHandle), connectedAddress);
+
+      const sdkClient = createSdkClient();
+      if (!sdkClient) {
+        toast.error("SDK client unavailable.");
+        return;
+      }
+
+      await runWrite("Finalize pending purchase", () =>
+        sdkClient.auction.finalizePendingPurchase({
+          poolId,
+          paymentProof: {
+            value: paymentProof.decryptedValue,
+            signature: paymentProof.signature,
+          },
+          fillProof: {
+            value: fillProof.decryptedValue,
+            signature: fillProof.signature,
+          },
         }),
       );
     } catch (err) {
@@ -978,7 +1396,7 @@ const Home = () => {
               <p className="m-0 text-xs uppercase tracking-[0.18em] text-base-content/60">Base Sepolia Deployment</p>
               <h1 className="m-0 text-3xl font-semibold tracking-tight">Stealth Dutch Auction Interface</h1>
               <p className="mb-0 mt-2 text-sm text-base-content/70">
-                Swap `token0` into payment token and settle auction allocation in the same transaction through the hook.
+                Step 1 registers encrypted intent on swap. Step 2 finalizes settlement with decrypt-for-tx proofs.
               </p>
             </div>
             <div className="grid gap-2 text-xs text-base-content/80">
@@ -1287,7 +1705,7 @@ const Home = () => {
           <section className="rounded-3xl border border-base-300 bg-base-100 p-6 shadow-xl shadow-base-300/40">
             <div className="mb-4 flex items-center justify-between gap-4">
               <h2 className="m-0 text-xl font-semibold">Buyer Swap + Auction Intent</h2>
-              <span className="rounded-full bg-base-200 px-3 py-1 text-xs">One transaction flow</span>
+              <span className="rounded-full bg-base-200 px-3 py-1 text-xs">Two-step settlement flow</span>
             </div>
 
             <form className="grid gap-3" onSubmit={onSwapAndBuy}>
@@ -1354,16 +1772,62 @@ const Home = () => {
                 </div>
               )}
 
-              <button className="btn btn-primary mt-2" type="submit" disabled={txIsConfirming || !isAuctionConfigReady}>
-                Execute Swap + Auction Buy
+              <button
+                className="btn btn-primary mt-2"
+                type="submit"
+                disabled={txIsConfirming || relayerBusy || !isAuctionConfigReady}
+              >
+                Step 1: Execute Swap + Register Intent
               </button>
               <button
                 className="btn btn-secondary"
                 type="button"
                 onClick={() => void onDirectBuyWithPaymentToken()}
-                disabled={txIsConfirming || !isAuctionConfigReady || !auctionIsActive}
+                disabled={txIsConfirming || relayerBusy || !isAuctionConfigReady || !auctionIsActive}
               >
-                Direct Buy With Payment Token
+                Step 1: Direct Buy + Register Intent
+              </button>
+              <div className="mt-2 rounded-2xl border border-base-300 bg-base-200/30 p-3 text-xs">
+                <p className="m-0 font-semibold">Manual finalize mode (v1)</p>
+                <p className="m-0 mt-1">
+                  Step 2 remains visible and must be executed manually after pending settlement becomes ready.
+                </p>
+              </div>
+              <div className="mt-2 rounded-2xl border border-base-300 bg-base-200/30 p-3 text-xs">
+                <p className="m-0 font-semibold">Pending Settlement</p>
+                <p className="m-0 mt-1">Source: {effectivePendingSource}</p>
+                <p className="m-0">Auction: {formatInt(effectivePendingAuctionId)}</p>
+                <p className="m-0">Ready: {effectivePendingReady ? "yes" : "no"}</p>
+                <p className="m-0">Fill Handle: {shortHash(effectivePendingFillHandle)}</p>
+                <p className="m-0">Payment Handle: {shortHash(effectivePendingPaymentHandle)}</p>
+                <p className="m-0">
+                  Finalize Deadline: {effectivePendingFinalizeDeadline > 0n ? effectivePendingFinalizeDeadline.toString() : "-"}
+                </p>
+                {pendingReadErrorText && (
+                  <p className="m-0 mt-1 text-warning">Pending read error: {pendingReadErrorText}</p>
+                )}
+                {pendingFeatureUnsupported && (
+                  <p className="m-0 mt-1 text-warning">
+                    This deployment is missing 2-step pending APIs. Step 2 will remain disabled until you redeploy latest hook.
+                  </p>
+                )}
+              </div>
+              <button
+                className="btn btn-accent"
+                type="button"
+                onClick={() => void onFinalizePendingPurchase()}
+                disabled={
+                  txIsConfirming ||
+                  relayerBusy ||
+                  !isAuctionConfigReady ||
+                  pendingFeatureUnsupported ||
+                  !effectivePendingReady ||
+                  effectivePendingAuctionId === 0n ||
+                  effectivePendingPaymentHandle === ZERO_HANDLE ||
+                  effectivePendingFillHandle === ZERO_HANDLE
+                }
+              >
+                Step 2: Finalize Pending Purchase
               </button>
             </form>
           </section>

@@ -8,6 +8,7 @@ contract MockFHERC20 is IFHERC20Encrypted {
     error InsufficientBalance();
     error InsufficientAllowance();
     error InvalidAddress();
+    error DecryptResultNotReady();
 
     string public name;
     string public symbol;
@@ -56,7 +57,9 @@ contract MockFHERC20 is IFHERC20Encrypted {
 
     function transferFromEncrypted(address from, address to, euint128 encryptedAmount) external returns (bool) {
         FHE.decrypt(encryptedAmount);
-        uint128 amount = FHE.getDecryptResult(encryptedAmount);
+        (uint128 amount, bool ready) = FHE.getDecryptResultSafe(encryptedAmount);
+        if (!ready) revert DecryptResultNotReady();
+        if (amount == 0) return true;
 
         uint256 allowedAmount = allowance[from][msg.sender];
         if (allowedAmount < amount) revert InsufficientAllowance();

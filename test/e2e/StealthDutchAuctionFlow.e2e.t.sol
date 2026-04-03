@@ -93,6 +93,8 @@ contract StealthDutchAuctionFlowE2ETest is Test {
             firstBuy
         );
 
+        _finalizePending(buyerA, 20_000, 200);
+
         assertEq(auctionToken.balanceOf(buyerA), 200);
         assertEq(paymentToken.balanceOf(seller), 20_000);
         assertEq(paymentToken.balanceOf(buyerA), 10_000);
@@ -109,6 +111,8 @@ contract StealthDutchAuctionFlowE2ETest is Test {
             secondBuy
         );
 
+        _finalizePending(buyerB, 22_800, 300);
+
         assertEq(auctionToken.balanceOf(buyerB), 300);
         assertEq(auctionToken.balanceOf(seller), 0);
 
@@ -118,11 +122,11 @@ contract StealthDutchAuctionFlowE2ETest is Test {
 
         (PoolId storedPoolId,,, uint256 activeAuctionId) = hook.poolAuctions(poolId);
         assertEq(PoolId.unwrap(storedPoolId), PoolId.unwrap(poolId));
-        assertEq(activeAuctionId, auctionId);
+        assertEq(activeAuctionId, 0);
 
         (, bool isActive,,,, uint128 sold, uint128 supply,,) = hook.getAuctionPlainState(auctionId);
-        assertTrue(isActive);
-        assertEq(sold, 0);
+        assertFalse(isActive);
+        assertEq(sold, 500);
         assertEq(supply, 500);
     }
 
@@ -143,5 +147,10 @@ contract StealthDutchAuctionFlowE2ETest is Test {
         uint256 handle = nextCiphertextHandle++;
         MockTaskManager(TASK_MANAGER).publishDecryptResult(handle, value, "");
         return InEuint128({ctHash: handle, securityZone: 0, utype: 6, signature: bytes("")});
+    }
+
+    function _finalizePending(address actor, uint128 paymentResult, uint128 fillResult) internal {
+        vm.prank(actor);
+        hook.finalizePendingPurchase(poolId, paymentResult, bytes(""), fillResult, bytes(""));
     }
 }

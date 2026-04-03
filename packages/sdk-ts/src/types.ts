@@ -183,3 +183,23 @@ export type SwapAndBuyParams = {
   mode: HookDataMode;
   proofs?: HookDataBuildInput["proofs"];
 };
+
+export type PendingPurchase = {
+  auctionId: bigint;
+  encAuctionTokensHandle: Hex;
+  maxPricePerToken: bigint;
+  minPaymentTokensFromSwap: bigint;
+  priceAtIntent: bigint;
+  paymentOut: bigint;
+  maxAffordableTokens: bigint;
+  encFinalFillHandle: Hex;
+  encFinalPaymentHandle: Hex;
+  finalizeDeadline: bigint;
+  ready: boolean;
+  direct: boolean;
+};
+
+export type DecryptProofPayload = {
+  value: bigint;
+  signature: Hex;
+};

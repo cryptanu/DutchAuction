@@ -12,7 +12,10 @@ export type AuctionClientErrorCode =
   | "PRICE_CAP_TOO_LOW"
   | "INSUFFICIENT_SWAP_OUTPUT"
   | "MIN_PAYMENT_TOO_HIGH"
-  | "POOL_NOT_AVAILABLE";
+  | "POOL_NOT_AVAILABLE"
+  | "PROOF_INVALID"
+  | "PENDING_NOT_READY"
+  | "PENDING_EXPIRED";
 
 export class AuctionClientError extends Error {
   readonly code: AuctionClientErrorCode;

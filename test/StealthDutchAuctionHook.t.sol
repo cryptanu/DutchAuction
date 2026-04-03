@@ -20,6 +20,7 @@ contract StealthDutchAuctionHookTest is Test {
 
     address internal seller = makeAddr("seller");
     address internal buyer = makeAddr("buyer");
+    address internal relayer = makeAddr("relayer");
 
     MockFHERC20 internal weth;
     MockFHERC20 internal paymentToken;
@@ -88,6 +89,12 @@ contract StealthDutchAuctionHookTest is Test {
         );
 
         assertEq(weth.balanceOf(buyer), 998);
+        assertEq(paymentToken.balanceOf(buyer), 2_000);
+        assertEq(paymentToken.balanceOf(seller), 0);
+        assertEq(auctionToken.balanceOf(buyer), 0);
+
+        _finalizePending(buyer, 1_000, 10);
+
         assertEq(paymentToken.balanceOf(buyer), 1_000);
         assertEq(paymentToken.balanceOf(seller), 1_000);
         assertEq(auctionToken.balanceOf(buyer), 10);
@@ -103,6 +110,12 @@ contract StealthDutchAuctionHookTest is Test {
 
         assertEq(spent, 0);
         assertEq(weth.balanceOf(buyer), 1_000);
+        assertEq(paymentToken.balanceOf(buyer), 1_500);
+        assertEq(paymentToken.balanceOf(seller), 0);
+        assertEq(auctionToken.balanceOf(buyer), 0);
+
+        _finalizePending(buyer, 1_000, 10);
+
         assertEq(paymentToken.balanceOf(buyer), 500);
         assertEq(paymentToken.balanceOf(seller), 1_000);
         assertEq(auctionToken.balanceOf(buyer), 10);
@@ -137,6 +150,8 @@ contract StealthDutchAuctionHookTest is Test {
         assertEq(paymentToken.balanceOf(buyer), 2_000);
         assertEq(paymentToken.balanceOf(seller), 0);
         assertEq(auctionToken.balanceOf(buyer), 0);
+        StealthDutchAuctionHook.PendingPurchase memory pending = hook.getPendingPurchase(buyer, poolId);
+        assertEq(pending.auctionId, 0);
     }
 
     function test_buyWithPaymentTokenEncrypted_priceAboveLimit_noSettlement() public {
@@ -149,6 +164,8 @@ contract StealthDutchAuctionHookTest is Test {
         assertEq(paymentToken.balanceOf(buyer), 2_000);
         assertEq(paymentToken.balanceOf(seller), 0);
         assertEq(auctionToken.balanceOf(buyer), 0);
+        StealthDutchAuctionHook.PendingPurchase memory pending = hook.getPendingPurchase(buyer, poolId);
+        assertEq(pending.auctionId, 0);
     }
 
     function test_buyWithPaymentToken_plaintextEntryPointDisabled() public {
@@ -171,9 +188,48 @@ contract StealthDutchAuctionHookTest is Test {
         assertEq(paymentToken.balanceOf(buyer), 2_000);
         assertEq(paymentToken.balanceOf(seller), 0);
         assertEq(auctionToken.balanceOf(buyer), 0);
+        StealthDutchAuctionHook.PendingPurchase memory pending = hook.getPendingPurchase(buyer, poolId);
+        assertEq(pending.auctionId, 0);
     }
 
-    function test_supplyCap_preventsOversell_withoutDeactivatingAuction() public {
+    function test_finalizePendingPurchase_revertsOnInvalidProofPayload() public {
+        bytes memory hookData = _buildEncryptedSwapIntent(10, 110, 1_900);
+
+        vm.prank(buyer);
+        poolManager.swap(
+            poolKey,
+            SwapParams({zeroForOne: true, amountSpecified: -int256(uint256(2)), sqrtPriceLimitX96: 0}),
+            hookData
+        );
+
+        vm.prank(buyer);
+        vm.expectRevert(StealthDutchAuctionHook.InvalidDecryptProof.selector);
+        hook.finalizePendingPurchase(poolId, 999, bytes(""), 10, bytes(""));
+    }
+
+    function test_finalizePendingPurchaseFor_allowsRelayerSponsoredFinalize() public {
+        bytes memory hookData = _buildEncryptedSwapIntent(10, 110, 1_900);
+
+        vm.prank(buyer);
+        poolManager.swap(
+            poolKey,
+            SwapParams({zeroForOne: true, amountSpecified: -int256(uint256(2)), sqrtPriceLimitX96: 0}),
+            hookData
+        );
+
+        vm.prank(relayer);
+        hook.finalizePendingPurchaseFor(buyer, poolId, 1_000, bytes(""), 10, bytes(""));
+
+        assertEq(paymentToken.balanceOf(buyer), 1_000);
+        assertEq(paymentToken.balanceOf(seller), 1_000);
+        assertEq(auctionToken.balanceOf(buyer), 10);
+        assertEq(auctionToken.balanceOf(seller), 990);
+
+        StealthDutchAuctionHook.PendingPurchase memory pending = hook.getPendingPurchase(buyer, poolId);
+        assertEq(pending.auctionId, 0);
+    }
+
+    function test_supplyCap_marksAuctionSoldOut_afterFinalize() public {
         bytes memory hookData = _buildEncryptedSwapIntent(1_000, 110, 100_000);
 
         vm.prank(buyer);
@@ -182,6 +238,8 @@ contract StealthDutchAuctionHookTest is Test {
             SwapParams({zeroForOne: true, amountSpecified: -int256(uint256(100)), sqrtPriceLimitX96: 0}),
             hookData
         );
+
+        _finalizePending(buyer, 100_000, 1_000);
 
         assertEq(auctionToken.balanceOf(buyer), 1_000);
 
@@ -199,10 +257,10 @@ contract StealthDutchAuctionHookTest is Test {
 
         (PoolId storedPoolId,,, uint256 activeAuctionId_) = hook.poolAuctions(poolId);
         assertEq(PoolId.unwrap(storedPoolId), PoolId.unwrap(poolId));
-        assertEq(activeAuctionId_, auctionId);
+        assertEq(activeAuctionId_, 0);
 
         (, bool isActive,,,,,,,) = hook.getAuctionPlainState(auctionId);
-        assertTrue(isActive);
+        assertFalse(isActive);
     }
 
     function test_initializeAuctionPool_revertsWhenTaskManagerUnavailable() public {
@@ -279,5 +337,10 @@ contract StealthDutchAuctionHookTest is Test {
         uint256 handle = nextCiphertextHandle++;
         MockTaskManager(TASK_MANAGER).publishDecryptResult(handle, value, "");
         return InEuint128({ctHash: handle, securityZone: 0, utype: 6, signature: bytes("")});
+    }
+
+    function _finalizePending(address actor, uint128 paymentResult, uint128 fillResult) internal {
+        vm.prank(actor);
+        hook.finalizePendingPurchase(poolId, paymentResult, bytes(""), fillResult, bytes(""));
     }
 }
